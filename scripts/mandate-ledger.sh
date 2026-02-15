@@ -2,11 +2,83 @@
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
 
+set -euo pipefail
+umask 077
+
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
 KYA_FILE="$LEDGER_DIR/agents.json"
 AUDIT_FILE="$LEDGER_DIR/audit.json"
 KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
+
+SAFE_FIELD_RE='^[A-Za-z0-9._:@/-]+$'
+SAFE_PATH_RE='^[A-Za-z0-9._/@*,:+= -]+$'
+SAFE_NUMBER_RE='^[0-9]+([.][0-9]+)?$'
+
+json_error() {
+    local message="$1"
+    printf '{"error": "%s"}\n' "$message"
+}
+
+assert_safe_field() {
+    local field_name="$1"
+    local value="$2"
+    if [ -z "$value" ] || ! [[ "$value" =~ $SAFE_FIELD_RE ]]; then
+        json_error "Invalid $field_name"
+        return 1
+    fi
+}
+
+assert_safe_path_value() {
+    local field_name="$1"
+    local value="$2"
+    if [ -z "$value" ] || [[ "$value" == *".."* ]] || ! [[ "$value" =~ $SAFE_PATH_RE ]]; then
+        json_error "Invalid $field_name"
+        return 1
+    fi
+}
+
+assert_safe_amount() {
+    local field_name="$1"
+    local value="$2"
+    if [ -z "$value" ] || ! [[ "$value" =~ $SAFE_NUMBER_RE ]]; then
+        json_error "Invalid $field_name"
+        return 1
+    fi
+}
+
+assert_valid_json() {
+    local input="$1"
+    if ! printf '%s' "$input" | jq -e . >/dev/null 2>&1; then
+        json_error "Invalid JSON payload"
+        return 1
+    fi
+}
+
+safe_write_json_file() {
+    local target_file="$1"
+    local content="$2"
+    local tmp_file
+    tmp_file="$(mktemp "$LEDGER_DIR/.tmp.XXXXXX")"
+    printf '%s\n' "$content" > "$tmp_file"
+    mv -f -- "$tmp_file" "$target_file"
+}
+
+safe_write_text_file() {
+    local target_file="$1"
+    local content="$2"
+    local tmp_file
+    tmp_file="$(mktemp "$LEDGER_DIR/.tmp.XXXXXX")"
+    printf '%s\n' "$content" > "$tmp_file"
+    mv -f -- "$tmp_file" "$target_file"
+}
+
+validate_ledger_dir() {
+    if [ -z "$LEDGER_DIR" ] || [[ "$LEDGER_DIR" == *".."* ]] || [[ "$LEDGER_DIR" == *$'\n'* ]]; then
+        echo "Error: Invalid ledger directory path" >&2
+        return 1
+    fi
+}
 
 # Action categories
 # - financial: purchases, transfers, subscriptions
@@ -17,15 +89,16 @@ KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 # - identity: public actions "as" the user
 
 init_ledger() {
-    mkdir -p "$LEDGER_DIR"
+    validate_ledger_dir
+    mkdir -p -- "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.1.0"}' > "$LEDGER_FILE"
+        safe_write_json_file "$LEDGER_FILE" '{"mandates":[],"version":"2.1.0"}'
     fi
     if [ ! -f "$KYA_FILE" ]; then
-        echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
+        safe_write_json_file "$KYA_FILE" '{"agents":[],"version":"1.0"}'
     fi
     if [ ! -f "$AUDIT_FILE" ]; then
-        echo '{"entries":[],"version":"1.0"}' > "$AUDIT_FILE"
+        safe_write_json_file "$AUDIT_FILE" '{"entries":[],"version":"1.0"}'
     fi
 }
 
@@ -41,10 +114,10 @@ generate_id() {
 # Audit logging
 audit_log() {
     init_ledger
-    local action="$1"
-    local mandate_id="$2"
-    local details="$3"
-    local result="$4"
+    local action="${1:-}"
+    local mandate_id="${2:-}"
+    local details="${3:-}"
+    local result="${4:-}"
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local entry_id=$(generate_id "audit")
     
@@ -57,18 +130,26 @@ audit_log() {
         --arg ts "$now" \
         '{entry_id: $id, action: $action, mandate_id: $mandate, details: $details, result: $result, timestamp: $ts}')
     
-    local updated=$(jq --argjson e "$entry" '.entries += [$e]' "$AUDIT_FILE")
-    echo "$updated" > "$AUDIT_FILE"
+    local updated
+    updated="$(jq --argjson e "$entry" '.entries += [$e]' "$AUDIT_FILE")"
+    safe_write_json_file "$AUDIT_FILE" "$updated"
 }
 
 create_mandate() {
     init_ledger
-    local id=$(generate_id)
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local payload="$1"
+    local id
+    id="$(generate_id)"
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    local payload="${1:-}"
+
+    if ! assert_valid_json "$payload"; then
+        return 1
+    fi
     
     # Validate action_type
-    local action_type=$(echo "$payload" | jq -r '.action_type // "financial"')
+    local action_type
+    action_type="$(printf '%s' "$payload" | jq -r '.action_type // "financial"')"
     case "$action_type" in
         financial|communication|data|system|external_api|identity)
             ;;
@@ -79,19 +160,25 @@ create_mandate() {
     esac
     
     # Validate required fields
-    local agent_id=$(echo "$payload" | jq -r '.agent_id // empty')
+    local agent_id
+    agent_id="$(printf '%s' "$payload" | jq -r '.agent_id // empty')"
     if [ -z "$agent_id" ]; then
         echo '{"error": "Missing required field: agent_id"}'
         return 1
     fi
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
     
-    local ttl=$(echo "$payload" | jq -r '.ttl // empty')
+    local ttl
+    ttl="$(printf '%s' "$payload" | jq -r '.ttl // empty')"
     if [ -z "$ttl" ]; then
         echo '{"error": "Missing required field: ttl"}'
         return 1
     fi
     
-    local has_scope=$(echo "$payload" | jq 'has("scope")')
+    local has_scope
+    has_scope="$(printf '%s' "$payload" | jq 'has("scope")')"
     if [ "$has_scope" != "true" ]; then
         echo '{"error": "Missing required field: scope"}'
         return 1
@@ -104,7 +191,8 @@ create_mandate() {
     fi
     
     # Add metadata and defaults
-    local mandate=$(echo "$payload" | jq \
+    local mandate
+    mandate="$(printf '%s' "$payload" | jq \
         --arg id "$id" \
         --arg created "$now" \
         --arg status "active" \
@@ -115,11 +203,12 @@ create_mandate() {
             status: $status,
             action_type: $action_type,
             usage: (.usage // {count: 0, total_amount: 0})
-        }')
+        }')"
     
     # Append to ledger
-    local updated=$(jq --argjson m "$mandate" '.mandates += [$m]' "$LEDGER_FILE")
-    echo "$updated" > "$LEDGER_FILE"
+    local updated
+    updated="$(jq --argjson m "$mandate" '.mandates += [$m]' "$LEDGER_FILE")"
+    safe_write_json_file "$LEDGER_FILE" "$updated"
     
     audit_log "create" "$id" "$action_type mandate created" "success"
     echo "$mandate"
@@ -127,7 +216,7 @@ create_mandate() {
 
 get_mandate() {
     init_ledger
-    local id="$1"
+    local id="${1:-}"
     jq --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE"
 }
 
@@ -154,14 +243,20 @@ list_mandates() {
 
 revoke_mandate() {
     init_ledger
-    local id="$1"
+    local id="${1:-}"
     local reason="${2:-revoked by user}"
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    if ! assert_safe_field "mandate_id" "$id"; then
+        return 1
+    fi
     
-    local updated=$(jq --arg id "$id" --arg reason "$reason" --arg revoked "$now" \
+    local updated
+    updated="$(jq --arg id "$id" --arg reason "$reason" --arg revoked "$now" \
         '.mandates = [.mandates[] | if .mandate_id == $id then . + {status: "revoked", revoked_at: $revoked, revoke_reason: $reason} else . end]' \
-        "$LEDGER_FILE")
-    echo "$updated" > "$LEDGER_FILE"
+        "$LEDGER_FILE")"
+    safe_write_json_file "$LEDGER_FILE" "$updated"
     
     audit_log "revoke" "$id" "reason: $reason" "success"
     get_mandate "$id"
@@ -170,11 +265,22 @@ revoke_mandate() {
 # Universal action check - works for all action types
 check_action() {
     init_ledger
-    local agent_id="$1"
-    local action_type="$2"
-    local target="$3"      # merchant_id for financial, recipient for comms, path for data, etc.
-    local amount="$4"      # amount for financial, count for rate-limited actions
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local agent_id="${1:-}"
+    local action_type="${2:-}"
+    local target="${3:-}"      # merchant_id for financial, recipient for comms, path for data, etc.
+    local amount="${4:-}"      # amount for financial, count for rate-limited actions
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
+    if ! assert_safe_field "action_type" "$action_type"; then
+        return 1
+    fi
+    if [ "$action_type" = "data" ] && ! assert_safe_path_value "target" "$target"; then
+        return 1
+    fi
 
     if kill_switch_engaged; then
         echo '{"authorized": false, "reason": "Kill switch engaged", "kill_switch": true}'
@@ -183,16 +289,21 @@ check_action() {
     
     # Default amount to 1 for non-financial
     amount="${amount:-1}"
+    if ! assert_safe_amount "amount" "$amount"; then
+        return 1
+    fi
     
     # Check if ledger is completely empty
-    local total_mandates=$(jq '.mandates | length' "$LEDGER_FILE")
+    local total_mandates
+    total_mandates="$(jq '.mandates | length' "$LEDGER_FILE")"
     if [ "$total_mandates" -eq 0 ]; then
         echo '{"authorized": false, "reason": "No mandates exist yet. Create one with: mandate-ledger.sh create-from-template dev-tools <agent_id>", "hint": "templates"}'
         return 0
     fi
 
     # Find valid mandate for this action type
-    local mandate=$(jq -c \
+    local mandate
+    mandate="$(jq -c \
         --arg agent "$agent_id" \
         --arg type "$action_type" \
         --arg target "$target" \
@@ -260,17 +371,22 @@ check_action() {
                 (.scope.rate_limit == null) or
                 ((.usage.count // 0) < (.scope.rate_limit | split("/")[0] | tonumber))
             )
-        )] | first // null' "$LEDGER_FILE")
+        )] | first // null' "$LEDGER_FILE")"
     
     if [ "$mandate" != "null" ] && [ -n "$mandate" ]; then
-        local mandate_id=$(echo "$mandate" | jq -r '.mandate_id')
+        local mandate_id
+        mandate_id="$(printf '%s' "$mandate" | jq -r '.mandate_id')"
         local remaining=""
         
         # Calculate remaining based on action type
         if [ "$action_type" = "financial" ]; then
-            local cap=$(echo "$mandate" | jq -r '.amount_cap // 0')
-            local used=$(echo "$mandate" | jq -r '.usage.total_amount // 0')
-            remaining=$(echo "$cap - $used" | bc)
+            local cap
+            cap="$(printf '%s' "$mandate" | jq -r '.amount_cap // 0')"
+            local used
+            used="$(printf '%s' "$mandate" | jq -r '.usage.total_amount // 0')"
+            if assert_safe_amount "amount_cap" "$cap" && assert_safe_amount "used" "$used"; then
+                remaining="$(awk -v c="$cap" -v u="$used" 'BEGIN { printf "%.10g", c - u }')"
+            fi
         fi
         
         echo '{"authorized": true, "mandate_id": "'"$mandate_id"'", "action_type": "'"$action_type"'", "target": "'"$target"'"'"$([ -n "$remaining" ] && echo ', "remaining": '$remaining)"'}'
@@ -281,28 +397,40 @@ check_action() {
 
 # Legacy check for backwards compatibility
 check_mandate() {
-    check_action "$1" "financial" "$2" "$3"
+    check_action "${1:-}" "financial" "${2:-}" "${3:-}"
 }
 
 # Log action against a mandate (universal)
 log_action() {
     init_ledger
-    local id="$1"
+    local id="${1:-}"
     local amount="${2:-1}"
     local description="${3:-action performed}"
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    if ! assert_safe_field "mandate_id" "$id"; then
+        return 1
+    fi
+    if ! assert_safe_amount "amount" "$amount"; then
+        return 1
+    fi
     
     # Get current mandate
-    local mandate=$(jq -c --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")
+    local mandate
+    mandate="$(jq -c --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")"
     
     if [ -z "$mandate" ] || [ "$mandate" = "null" ]; then
         echo '{"error": "Mandate not found"}'
         return 1
     fi
     
-    local status=$(echo "$mandate" | jq -r '.status')
-    local ttl=$(echo "$mandate" | jq -r '.ttl')
-    local action_type=$(echo "$mandate" | jq -r '.action_type')
+    local status
+    status="$(printf '%s' "$mandate" | jq -r '.status')"
+    local ttl
+    ttl="$(printf '%s' "$mandate" | jq -r '.ttl')"
+    local action_type
+    action_type="$(printf '%s' "$mandate" | jq -r '.action_type')"
     
     if [ "$status" != "active" ]; then
         echo '{"error": "Mandate not active", "status": "'"$status"'"}'
@@ -316,21 +444,31 @@ log_action() {
     
     # Check caps based on action type
     if [ "$action_type" = "financial" ]; then
-        local cap=$(echo "$mandate" | jq -r '.amount_cap // 0')
-        local used=$(echo "$mandate" | jq -r '.usage.total_amount // 0')
-        local new_used=$(echo "$used + $amount" | bc)
+        local cap
+        cap="$(printf '%s' "$mandate" | jq -r '.amount_cap // 0')"
+        local used
+        used="$(printf '%s' "$mandate" | jq -r '.usage.total_amount // 0')"
+        local new_used
+        new_used="$(awk -v u="$used" -v a="$amount" 'BEGIN { printf "%.10g", u + a }')"
         
-        if (( $(echo "$new_used > $cap" | bc -l) )); then
+        if awk -v n="$new_used" -v c="$cap" 'BEGIN { exit !(n > c) }'; then
             echo '{"error": "Exceeds cap", "cap": '$cap', "used": '$used', "requested": '$amount'}'
             return 1
         fi
     fi
     
     # Check rate limit
-    local rate_limit=$(echo "$mandate" | jq -r '.scope.rate_limit // empty')
+    local rate_limit
+    rate_limit="$(printf '%s' "$mandate" | jq -r '.scope.rate_limit // empty')"
     if [ -n "$rate_limit" ]; then
-        local limit_count=$(echo "$rate_limit" | cut -d'/' -f1)
-        local current_count=$(echo "$mandate" | jq -r '.usage.count // 0')
+        if ! [[ "$rate_limit" =~ ^[0-9]+/(day|hour|minute|week|month|year)$ ]]; then
+            echo '{"error": "Invalid rate_limit format", "rate_limit": "'"$rate_limit"'"}'
+            return 1
+        fi
+        local limit_count
+        limit_count="$(printf '%s' "$rate_limit" | cut -d'/' -f1)"
+        local current_count
+        current_count="$(printf '%s' "$mandate" | jq -r '.usage.count // 0')"
         if (( current_count >= limit_count )); then
             echo '{"error": "Rate limit exceeded", "limit": "'"$rate_limit"'", "current": '$current_count'}'
             return 1
@@ -338,16 +476,19 @@ log_action() {
     fi
     
     # Update usage
-    local updated=$(jq --arg id "$id" --argjson amt "$amount" \
+    local updated
+    updated="$(jq --arg id "$id" --argjson amt "$amount" \
         '.mandates = [.mandates[] | if .mandate_id == $id then 
             .usage.count = ((.usage.count // 0) + 1) |
             .usage.total_amount = ((.usage.total_amount // 0) + $amt)
-        else . end]' "$LEDGER_FILE")
-    echo "$updated" > "$LEDGER_FILE"
+        else . end]' "$LEDGER_FILE")"
+    safe_write_json_file "$LEDGER_FILE" "$updated"
     
     # Get updated stats
-    local new_count=$(echo "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.count')
-    local new_total=$(echo "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.total_amount')
+    local new_count
+    new_count="$(printf '%s' "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.count')"
+    local new_total
+    new_total="$(printf '%s' "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.total_amount')"
     
     audit_log "action" "$id" "$description" "success"
     
@@ -356,7 +497,7 @@ log_action() {
 
 # Legacy spend for backwards compatibility
 spend() {
-    log_action "$1" "$2" "financial transaction"
+    log_action "${1:-}" "${2:-}" "financial transaction"
 }
 
 export_ledger() {
@@ -368,12 +509,16 @@ export_ledger() {
 audit_list() {
     init_ledger
     local limit="${1:-20}"
+    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo '{"error":"Invalid limit"}'
+        return 1
+    fi
     jq --argjson n "$limit" '.entries | sort_by(.timestamp) | reverse | .[:$n]' "$AUDIT_FILE"
 }
 
 audit_for_mandate() {
     init_ledger
-    local mandate_id="$1"
+    local mandate_id="${1:-}"
     jq --arg id "$mandate_id" '.entries | map(select(.mandate_id == $id))' "$AUDIT_FILE"
 }
 
@@ -399,29 +544,37 @@ audit_summary() {
 # KYA (Know Your Agent) functions
 kya_register() {
     init_ledger
-    local agent_id="$1"
-    local principal="$2"
-    local scope="$3"
+    local agent_id="${1:-}"
+    local principal="${2:-}"
+    local scope="${3:-}"
     local provider="${4:-self-declared}"
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
     
     # Check if agent already exists
-    local existing=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE")
+    local existing
+    existing="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE")"
     
     if [ -n "$existing" ]; then
         # Update existing
-        local updated=$(jq --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" \
+        local updated
+        updated="$(jq --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" \
             '.agents = [.agents[] | if .agent_id == $id then . + {
                 verified_principal: $principal,
                 authorization_scope: $scope,
                 provider: $provider,
                 verified_at: $now,
                 status: "verified"
-            } else . end]' "$KYA_FILE")
-        echo "$updated" > "$KYA_FILE"
+            } else . end]' "$KYA_FILE")"
+        safe_write_json_file "$KYA_FILE" "$updated"
     else
         # Create new
-        local agent=$(jq -n --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" '{
+        local agent
+        agent="$(jq -n --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" '{
             agent_id: $id,
             verified_principal: $principal,
             authorization_scope: $scope,
@@ -429,9 +582,10 @@ kya_register() {
             verified_at: $now,
             status: "verified",
             created_at: $now
-        }')
-        local updated=$(jq --argjson agent "$agent" '.agents += [$agent]' "$KYA_FILE")
-        echo "$updated" > "$KYA_FILE"
+        }')"
+        local updated
+        updated="$(jq --argjson agent "$agent" '.agents += [$agent]' "$KYA_FILE")"
+        safe_write_json_file "$KYA_FILE" "$updated"
     fi
     
     audit_log "kya_register" "$agent_id" "principal: $principal" "success"
@@ -440,7 +594,7 @@ kya_register() {
 
 kya_get() {
     init_ledger
-    local agent_id="$1"
+    local agent_id="${1:-}"
     jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE"
 }
 
@@ -451,14 +605,20 @@ kya_list() {
 
 kya_revoke() {
     init_ledger
-    local agent_id="$1"
+    local agent_id="${1:-}"
     local reason="${2:-revoked by user}"
-    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
     
-    local updated=$(jq --arg id "$agent_id" --arg reason "$reason" --arg now "$now" \
+    local updated
+    updated="$(jq --arg id "$agent_id" --arg reason "$reason" --arg now "$now" \
         '.agents = [.agents[] | if .agent_id == $id then . + {status: "revoked", revoked_at: $now, revoke_reason: $reason} else . end]' \
-        "$KYA_FILE")
-    echo "$updated" > "$KYA_FILE"
+        "$KYA_FILE")"
+    safe_write_json_file "$KYA_FILE" "$updated"
     
     audit_log "kya_revoke" "$agent_id" "reason: $reason" "success"
     kya_get "$agent_id"
@@ -467,18 +627,26 @@ kya_revoke() {
 # Create mandate with auto-KYA attachment
 create_mandate_with_kya() {
     init_ledger
-    local payload="$1"
-    local agent_id=$(echo "$payload" | jq -r '.agent_id')
+    local payload="${1:-}"
+    if ! assert_valid_json "$payload"; then
+        return 1
+    fi
+    local agent_id
+    agent_id="$(printf '%s' "$payload" | jq -r '.agent_id')"
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
     
     # Look up KYA for this agent
-    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE")
+    local kya
+    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE")"
     
     if [ -n "$kya" ]; then
         # Attach KYA to scope
-        payload=$(echo "$payload" | jq --argjson kya "$kya" '.scope.kya = $kya')
+        payload="$(printf '%s' "$payload" | jq --argjson kya "$kya" '.scope.kya = $kya')"
     else
         # Mark as unknown
-        payload=$(echo "$payload" | jq '.scope.kya = {status: "unknown"}')
+        payload="$(printf '%s' "$payload" | jq '.scope.kya = {status: "unknown"}')"
     fi
     
     create_mandate "$payload"
@@ -529,11 +697,9 @@ summary() {
 kill_ledger() {
     init_ledger
     local reason="${*:-No reason provided}"
-
-    {
-        echo "reason=$reason"
-        echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    } > "$KILLSWITCH_FILE"
+    local kill_payload
+    kill_payload="$(printf 'reason=%s\ntimestamp=%s\n' "$reason" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")"
+    safe_write_text_file "$KILLSWITCH_FILE" "$kill_payload"
 
     audit_log "kill" "system" "reason: $reason" "success"
     echo "AGENT PASSPORT: KILL SWITCH ENGAGED. Execution frozen."
@@ -544,7 +710,7 @@ unlock_ledger() {
     init_ledger
 
     if [ -f "$KILLSWITCH_FILE" ]; then
-        rm -f "$KILLSWITCH_FILE"
+        rm -f -- "$KILLSWITCH_FILE"
         audit_log "unlock" "system" "kill switch removed" "success"
         echo "AGENT PASSPORT: KILL SWITCH DISENGAGED. Operations restored."
     else
@@ -555,7 +721,11 @@ unlock_ledger() {
 
 # Parse TTL duration string (7d, 24h, 30d) to ISO timestamp
 parse_ttl_duration() {
-    local duration="$1"
+    local duration="${1:-}"
+    if ! [[ "$duration" =~ ^[0-9]+[dhm]$ ]]; then
+        echo "Invalid duration: $duration (use e.g. 7d, 24h, 30m)" >&2
+        return 1
+    fi
     local num="${duration%[dhm]}"
     local unit="${duration: -1}"
     
@@ -572,12 +742,20 @@ parse_ttl_duration() {
 
 # Template definitions
 get_template() {
-    local template="$1"
-    local agent_id="$2"
+    local template="${1:-}"
+    local agent_id="${2:-}"
     shift 2
     
     if [ -z "$agent_id" ]; then
         echo "Error: agent_id required. Usage: create-from-template <template> <agent_id> [args...]" >&2
+        return 1
+    fi
+    if ! assert_safe_field "template" "$template" >/dev/null; then
+        echo "Error: invalid template value" >&2
+        return 1
+    fi
+    if ! assert_safe_field "agent_id" "$agent_id" >/dev/null; then
+        echo "Error: invalid agent_id" >&2
         return 1
     fi
     
@@ -599,9 +777,13 @@ get_template() {
             }'
             ;;
         email-team)
-            local domain="$1"
+            local domain="${1:-}"
             if [ -z "$domain" ]; then
                 echo "Error: domain required. Usage: create-from-template email-team <agent_id> <domain>" >&2
+                return 1
+            fi
+            if [[ "$domain" == *".."* ]] || [[ "$domain" == *"/"* ]] || [[ "$domain" == *"\\"* ]] || ! [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                echo "Error: invalid domain" >&2
                 return 1
             fi
             jq -n --arg agent "$agent_id" --arg ttl "$ttl_30d" --arg pattern "*@${domain}" '{
@@ -615,9 +797,13 @@ get_template() {
             }'
             ;;
         file-ops)
-            local basepath="$1"
+            local basepath="${1:-}"
             if [ -z "$basepath" ]; then
                 echo "Error: base path required. Usage: create-from-template file-ops <agent_id> <path>" >&2
+                return 1
+            fi
+            if ! assert_safe_path_value "basepath" "$basepath" >/dev/null; then
+                echo "Error: invalid base path" >&2
                 return 1
             fi
             jq -n --arg agent "$agent_id" --arg ttl "$ttl_30d" --arg pattern "${basepath}/*" '{
@@ -724,9 +910,9 @@ get_default_agent() {
 }
 
 create_from_template() {
-    local template="$1"
+    local template="${1:-}"
     shift
-    local agent_id="$1"
+    local agent_id="${1:-}"
     
     # Auto-detect agent_id if not provided
     if [ -z "$agent_id" ]; then
@@ -737,14 +923,15 @@ create_from_template() {
         fi
     fi
     
-    local payload=$(get_template "$template" "$agent_id" "${@:2}")
-    if [ $? -ne 0 ]; then
+    local payload
+    if ! payload="$(get_template "$template" "$agent_id" "${@:2}")"; then
         echo "$payload"
         return 1
     fi
     
     # Check if agent has KYA entry, use create_mandate_with_kya if so
-    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null)
+    local kya
+    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null || true)"
     if [ -n "$kya" ]; then
         create_mandate_with_kya "$payload"
     else
@@ -753,11 +940,11 @@ create_from_template() {
 }
 
 create_quick() {
-    local action_type="$1"
-    local agent_id="$2"
-    local allowlist_csv="$3"
-    local ttl_duration="$4"
-    local amount_cap="$5"
+    local action_type="${1:-}"
+    local agent_id="${2:-}"
+    local allowlist_csv="${3:-}"
+    local ttl_duration="${4:-}"
+    local amount_cap="${5:-}"
     
     # Auto-detect agent_id if empty
     if [ -z "$agent_id" ]; then
@@ -772,15 +959,33 @@ create_quick() {
         echo '{"error": "Usage: create-quick <action_type> <agent_id> <allowlist_csv> <ttl_duration> [amount_cap]"}'
         return 1
     fi
+    if ! assert_safe_field "action_type" "$action_type"; then
+        return 1
+    fi
+    if ! assert_safe_field "agent_id" "$agent_id"; then
+        return 1
+    fi
+    if [[ "$allowlist_csv" == *'`'* ]] || [[ "$allowlist_csv" == *'$('* ]] || [[ "$allowlist_csv" == *';'* ]] || [[ "$allowlist_csv" == *'|'* ]]; then
+        json_error "Invalid allowlist_csv"
+        return 1
+    fi
+    if [ -n "${amount_cap:-}" ] && ! assert_safe_amount "amount_cap" "$amount_cap"; then
+        return 1
+    fi
     
-    local ttl=$(parse_ttl_duration "$ttl_duration")
-    if [ $? -ne 0 ] || [ -z "$ttl" ]; then
+    local ttl
+    if ! ttl="$(parse_ttl_duration "$ttl_duration")"; then
+        echo '{"error": "Invalid TTL duration: '"$ttl_duration"'. Use e.g. 7d, 24h, 30m"}'
+        return 1
+    fi
+    if [ -z "$ttl" ]; then
         echo '{"error": "Invalid TTL duration: '"$ttl_duration"'. Use e.g. 7d, 24h, 30m"}'
         return 1
     fi
     
     # Convert CSV to JSON array
-    local allowlist=$(echo "$allowlist_csv" | jq -R 'split(",")')
+    local allowlist
+    allowlist="$(printf '%s' "$allowlist_csv" | jq -R 'split(",")')"
     
     local payload
     if [ -n "$amount_cap" ]; then
@@ -802,7 +1007,8 @@ create_quick() {
     
     # Check if agent has KYA entry
     init_ledger
-    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null)
+    local kya
+    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null || true)"
     if [ -n "$kya" ]; then
         create_mandate_with_kya "$payload"
     else
@@ -818,7 +1024,7 @@ init_passport() {
     
     local mandate_count=0
     if [ -f "$LEDGER_FILE" ]; then
-        mandate_count=$(jq '.mandates | length' "$LEDGER_FILE" 2>/dev/null || echo 0)
+        mandate_count="$(jq '.mandates | length' "$LEDGER_FILE" 2>/dev/null || echo 0)"
         if [ "$mandate_count" -gt 0 ] || [ -f "$AUDIT_FILE" ]; then
             # Already initialized
             init_ledger
@@ -832,7 +1038,8 @@ init_passport() {
             fi
             
             # Check for existing registered agent
-            local registered=$(jq -r '.agents[] | select(.status == "verified") | "\(.agent_id) (principal: \(.verified_principal))"' "$KYA_FILE" 2>/dev/null | head -1)
+            local registered
+            registered="$(jq -r '.agents[] | select(.status == "verified") | "\(.agent_id) (principal: \(.verified_principal))"' "$KYA_FILE" 2>/dev/null | head -1 || true)"
             if [ -n "$registered" ]; then
                 echo "Already initialized at $LEDGER_DIR/ ($mandate_count mandates)"
                 echo "🪪 Registered agent: $registered"
@@ -923,7 +1130,7 @@ if kill_switch_engaged && [ "${1:-}" != "unlock" ]; then
     exit 1
 fi
 
-case "$1" in
+case "${1:-}" in
     init)
         init_passport "$@"
         ;;
@@ -931,45 +1138,45 @@ case "$1" in
         list_templates
         ;;
     create-from-template)
-        create_from_template "$2" "$3" "$4" "$5"
+        create_from_template "${2:-}" "${3:-}" "${4:-}" "${5:-}"
         ;;
     create-quick)
-        create_quick "$2" "$3" "$4" "$5" "$6"
+        create_quick "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
         ;;
     create)
-        create_mandate "$2"
+        create_mandate "${2:-}"
         ;;
     create-with-kya)
-        create_mandate_with_kya "$2"
+        create_mandate_with_kya "${2:-}"
         ;;
     get)
-        get_mandate "$2"
+        get_mandate "${2:-}"
         ;;
     list)
-        list_mandates "$2"
+        list_mandates "${2:-}"
         ;;
     revoke)
-        revoke_mandate "$2" "$3"
+        revoke_mandate "${2:-}" "${3:-}"
         ;;
     check)
         # Legacy: check <agent> <merchant> <amount>
         # New:    check <agent> <action_type> <target> [amount]
-        if [ "$#" -eq 4 ] && [[ "$3" =~ ^[0-9]+$ ]]; then
+        if [ "$#" -eq 4 ] && [[ "${3:-}" =~ ^[0-9]+$ ]]; then
             # Legacy format: third arg is numeric amount
-            check_mandate "$2" "$3" "$4"
+            check_mandate "${2:-}" "${3:-}" "${4:-}"
         else
             # New format
-            check_action "$2" "$3" "$4" "$5"
+            check_action "${2:-}" "${3:-}" "${4:-}" "${5:-}"
         fi
         ;;
     check-action)
-        check_action "$2" "$3" "$4" "$5"
+        check_action "${2:-}" "${3:-}" "${4:-}" "${5:-}"
         ;;
     log|log-action)
-        log_action "$2" "$3" "$4"
+        log_action "${2:-}" "${3:-}" "${4:-}"
         ;;
     spend)
-        spend "$2" "$3"
+        spend "${2:-}" "${3:-}"
         ;;
     summary)
         summary
@@ -978,25 +1185,25 @@ case "$1" in
         export_ledger
         ;;
     audit)
-        audit_list "$2"
+        audit_list "${2:-}"
         ;;
     audit-mandate)
-        audit_for_mandate "$2"
+        audit_for_mandate "${2:-}"
         ;;
     audit-summary)
-        audit_summary "$2"
+        audit_summary "${2:-}"
         ;;
     kya-register)
-        kya_register "$2" "$3" "$4" "$5"
+        kya_register "${2:-}" "${3:-}" "${4:-}" "${5:-}"
         ;;
     kya-get)
-        kya_get "$2"
+        kya_get "${2:-}"
         ;;
     kya-list)
         kya_list
         ;;
     kya-revoke)
-        kya_revoke "$2" "$3"
+        kya_revoke "${2:-}" "${3:-}"
         ;;
     kill)
         kill_ledger "${*:2}"
