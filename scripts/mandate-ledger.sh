@@ -217,7 +217,17 @@ create_mandate() {
 get_mandate() {
     init_ledger
     local id="${1:-}"
-    jq --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE"
+    if [ -z "$id" ]; then
+        echo '{"error": "Usage: get <mandate_id>"}'
+        return 1
+    fi
+    local result
+    result="$(jq --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")"
+    if [ -z "$result" ]; then
+        echo '{"error": "Mandate not found: '"$id"'"}'
+        return 1
+    fi
+    echo "$result"
 }
 
 list_mandates() {
@@ -502,7 +512,12 @@ spend() {
 
 export_ledger() {
     init_ledger
-    cat "$LEDGER_FILE"
+    local mandates agents audit
+    mandates="$(jq '.mandates' "$LEDGER_FILE")"
+    agents="$(jq '.agents' "$KYA_FILE" 2>/dev/null || echo '[]')"
+    audit="$(jq '.entries' "$AUDIT_FILE" 2>/dev/null || echo '[]')"
+    jq -n --argjson m "$mandates" --argjson a "$agents" --argjson au "$audit" \
+        '{"mandates": $m, "agents": $a, "audit": $au, "version": "2.1.0", "exported_at": (now | todate)}'
 }
 
 # Audit commands
@@ -696,7 +711,11 @@ summary() {
 
 kill_ledger() {
     init_ledger
-    local reason="${*:-No reason provided}"
+    if [ -z "${*}" ]; then
+        echo '{"error": "Usage: kill <reason> — reason is required"}'
+        return 1
+    fi
+    local reason="${*}"
     local kill_payload
     kill_payload="$(printf 'reason=%s\ntimestamp=%s\n' "$reason" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")"
     safe_write_text_file "$KILLSWITCH_FILE" "$kill_payload"
@@ -1161,11 +1180,11 @@ case "${1:-}" in
     check)
         # Legacy: check <agent> <merchant> <amount>
         # New:    check <agent> <action_type> <target> [amount]
-        if [ "$#" -eq 4 ] && [[ "${3:-}" =~ ^[0-9]+$ ]]; then
-            # Legacy format: third arg is numeric amount
+        if [ "$#" -eq 4 ] && [[ "${4:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            # Legacy format: check <agent> <merchant> <amount>
             check_mandate "${2:-}" "${3:-}" "${4:-}"
         else
-            # New format
+            # New format: check <agent> <action_type> <target> [amount]
             check_action "${2:-}" "${3:-}" "${4:-}" "${5:-}"
         fi
         ;;
