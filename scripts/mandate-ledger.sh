@@ -1,11 +1,12 @@
 #!/bin/bash
-# Agent Passport Lite - Local Mandate Ledger (Expanded)
+# Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
 KYA_FILE="$LEDGER_DIR/agents.json"
 AUDIT_FILE="$LEDGER_DIR/audit.json"
+KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 
 # Action categories
 # - financial: purchases, transfers, subscriptions
@@ -18,7 +19,7 @@ AUDIT_FILE="$LEDGER_DIR/audit.json"
 init_ledger() {
     mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.0"}' > "$LEDGER_FILE"
+        echo '{"mandates":[],"version":"2.1.0"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
         echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
@@ -26,6 +27,10 @@ init_ledger() {
     if [ ! -f "$AUDIT_FILE" ]; then
         echo '{"entries":[],"version":"1.0"}' > "$AUDIT_FILE"
     fi
+}
+
+kill_switch_engaged() {
+    [ -f "$KILLSWITCH_FILE" ]
 }
 
 generate_id() {
@@ -170,6 +175,11 @@ check_action() {
     local target="$3"      # merchant_id for financial, recipient for comms, path for data, etc.
     local amount="$4"      # amount for financial, count for rate-limited actions
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if kill_switch_engaged; then
+        echo '{"authorized": false, "reason": "Kill switch engaged", "kill_switch": true}'
+        return 0
+    fi
     
     # Default amount to 1 for non-financial
     amount="${amount:-1}"
@@ -199,7 +209,9 @@ check_action() {
                 (.scope.allowlist | length == 0) or
                 (.scope.allowlist | any(
                     . as $pattern |
-                    if (($pattern | startswith("*")) and ($pattern | endswith("*"))) then
+                    if ($pattern == "all" or $pattern == "*") then
+                        true
+                    elif (($pattern | startswith("*")) and ($pattern | endswith("*"))) then
                         # Double wildcard: contains match
                         ($target | contains($pattern[1:-1]))
                     elif ($pattern | startswith("*@")) then
@@ -476,7 +488,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.0"
+    echo "Agent Passport Local Ledger v2.1.0"
     echo "================================="
     echo ""
     
@@ -514,6 +526,33 @@ summary() {
     echo "Audit entries: $audit_count"
 }
 
+kill_ledger() {
+    init_ledger
+    local reason="${*:-No reason provided}"
+
+    {
+        echo "reason=$reason"
+        echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "$KILLSWITCH_FILE"
+
+    audit_log "kill" "system" "reason: $reason" "success"
+    echo "AGENT PASSPORT: KILL SWITCH ENGAGED. Execution frozen."
+    echo "Reason: $reason"
+}
+
+unlock_ledger() {
+    init_ledger
+
+    if [ -f "$KILLSWITCH_FILE" ]; then
+        rm -f "$KILLSWITCH_FILE"
+        audit_log "unlock" "system" "kill switch removed" "success"
+        echo "AGENT PASSPORT: KILL SWITCH DISENGAGED. Operations restored."
+    else
+        audit_log "unlock" "system" "unlock requested with no active kill switch" "success"
+        echo "AGENT PASSPORT: Kill switch was not engaged."
+    fi
+}
+
 # Parse TTL duration string (7d, 24h, 30d) to ISO timestamp
 parse_ttl_duration() {
     local duration="$1"
@@ -543,6 +582,9 @@ get_template() {
     fi
     
     local ttl_30d=$(parse_ttl_duration "30d")
+    local ttl_24h=$(parse_ttl_duration "24h")
+    local ttl_7d=$(parse_ttl_duration "7d")
+    local ttl_1d=$(parse_ttl_duration "1d")
     
     case "$template" in
         dev-tools)
@@ -599,8 +641,73 @@ get_template() {
                 ttl: $ttl
             }'
             ;;
+        safe-browsing)
+            jq -n --arg agent "$agent_id" --arg ttl "$ttl_24h" '{
+                action_type: "external_api",
+                agent_id: $agent,
+                scope: {
+                    allowlist: ["google.com", "wikipedia.org", "github.com", "stackoverflow.com"],
+                    rate_limit: "30/hour"
+                },
+                ttl: $ttl
+            }'
+            ;;
+        coding)
+            jq -n --arg agent "$agent_id" --arg ttl "$ttl_7d" '{
+                action_type: "system",
+                agent_id: $agent,
+                scope: {
+                    allowlist: [
+                        "git", "git *",
+                        "npm", "npm *",
+                        "node", "node *",
+                        "python", "python *",
+                        "pip", "pip *",
+                        "cargo", "cargo *",
+                        "make", "make *",
+                        "docker", "docker *"
+                    ],
+                    rate_limit: "100/hour"
+                },
+                ttl: $ttl
+            }'
+            ;;
+        email-assistant)
+            jq -n --arg agent "$agent_id" --arg ttl "$ttl_24h" '{
+                action_type: "communication",
+                agent_id: $agent,
+                scope: {
+                    allowlist: ["all"],
+                    rate_limit: "20/hour"
+                },
+                amount_cap: 0,
+                ttl: $ttl
+            }'
+            ;;
+        read-only)
+            jq -n --arg agent "$agent_id" --arg ttl "$ttl_24h" '{
+                action_type: "data",
+                agent_id: $agent,
+                scope: {
+                    allowlist: ["read", "list", "cat", "ls"],
+                    rate_limit: "50/hour"
+                },
+                ttl: $ttl
+            }'
+            ;;
+        full-auto)
+            jq -n --arg agent "$agent_id" --arg ttl "$ttl_1d" '{
+                action_type: "system",
+                agent_id: $agent,
+                scope: {
+                    allowlist: ["all"],
+                    rate_limit: "200/hour"
+                },
+                ttl: $ttl
+            }'
+            ;;
         *)
-            echo "Error: Unknown template '$template'. Available: dev-tools, email-team, file-ops, web-research" >&2
+            echo "Error: Unknown template '$template'. Available: dev-tools, email-team, file-ops, web-research, safe-browsing, coding, email-assistant, read-only, full-auto" >&2
             return 1
             ;;
     esac
@@ -761,7 +868,7 @@ init_passport() {
     echo "  # Check if an action is allowed:"
     echo "  ./mandate-ledger.sh check-action agent:seb system \"git pull\""
     echo ""
-    echo "Available templates: dev-tools, email-team, file-ops, web-research"
+    echo "Available templates: dev-tools, email-team, file-ops, web-research, safe-browsing, coding, email-assistant, read-only, full-auto"
     echo "Run: ./mandate-ledger.sh templates"
 }
 
@@ -783,9 +890,39 @@ list_templates() {
     echo "  web-research                  API access (GitHub, OpenAI, Anthropic)"
     echo "    Usage: create-from-template web-research <agent_id>"
     echo "    Rate: 200/hour  |  TTL: 30 days"
+    echo ""
+    echo "  safe-browsing                 Safer web/API browsing to trusted sites"
+    echo "    Usage: create-from-template safe-browsing <agent_id>"
+    echo "    Allow: google.com, wikipedia.org, github.com, stackoverflow.com"
+    echo "    Rate: 30/hour  |  TTL: 24 hours"
+    echo ""
+    echo "  coding                        High-throughput coding command access"
+    echo "    Usage: create-from-template coding <agent_id>"
+    echo "    Allow: git, npm, node, python, pip, cargo, make, docker"
+    echo "    Rate: 100/hour  |  TTL: 7 days"
+    echo ""
+    echo "  email-assistant               Broad email assistant communication"
+    echo "    Usage: create-from-template email-assistant <agent_id>"
+    echo "    Allow: all  |  Amount cap: 0"
+    echo "    Rate: 20/hour  |  TTL: 24 hours"
+    echo ""
+    echo "  read-only                     Read/list oriented data operations"
+    echo "    Usage: create-from-template read-only <agent_id>"
+    echo "    Allow: read, list, cat, ls"
+    echo "    Rate: 50/hour  |  TTL: 24 hours"
+    echo ""
+    echo "  full-auto                     Maximum automation scope"
+    echo "    Usage: create-from-template full-auto <agent_id>"
+    echo "    Allow: all"
+    echo "    Rate: 200/hour  |  TTL: 1 day"
 }
 
 # Command dispatcher
+if kill_switch_engaged && [ "${1:-}" != "unlock" ]; then
+    echo "AGENT PASSPORT: KILL SWITCH ENGAGED. All operations denied. Run: mandate-ledger.sh unlock" >&2
+    exit 1
+fi
+
 case "$1" in
     init)
         init_passport "$@"
@@ -861,8 +998,14 @@ case "$1" in
     kya-revoke)
         kya_revoke "$2" "$3"
         ;;
+    kill)
+        kill_ledger "${*:2}"
+        ;;
+    unlock)
+        unlock_ledger
+        ;;
     *)
-        echo "Agent Passport Lite - Local Mandate Ledger v2.0"
+        echo "Agent Passport - Local Mandate Ledger v2.1.0"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -910,6 +1053,10 @@ case "$1" in
         echo "  kya-get <agent_id>"
         echo "  kya-list"
         echo "  kya-revoke <agent_id> [why]"
+        echo ""
+        echo "SAFETY:"
+        echo "  kill <reason>                           Engage kill switch and freeze execution"
+        echo "  unlock                                  Disengage kill switch and resume execution"
         exit 1
         ;;
 esac
