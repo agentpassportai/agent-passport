@@ -1,11 +1,12 @@
 ---
-name: agent-passport-lite
+name: agent-passport
+version: 2.1.0
 description: "OAuth for the agentic era — consent-gating for ALL sensitive agent actions including purchases, emails, file operations, system commands, and API calls. Provides spending caps, rate limits, allowlists, TTL expiry, audit trails, and KYA (Know Your Agent) metadata."
 metadata: {"openclaw":{"requires":{"bins":["jq","bc","xxd","head","date","mkdir"],"env":["AGENT_PASSPORT_LEDGER_DIR"]}}}
 user-invocable: true
 ---
 
-# Agent Passport Lite (OpenClaw)
+# Agent Passport (OpenClaw)
 
 ## 30-Second Setup
 
@@ -19,7 +20,7 @@ user-invocable: true
 # That's it! The agent will now check permissions before sensitive actions.
 ```
 
-> **Templates available:** `dev-tools` · `email-team <domain>` · `file-ops <path>` · `web-research`
+> **Templates available:** `dev-tools` · `email-team <domain>` · `file-ops <path>` · `web-research` · `safe-browsing` · `coding` · `email-assistant` · `read-only` · `full-auto`
 > Run `./mandate-ledger.sh templates` to see all options.
 
 ---
@@ -46,7 +47,7 @@ Before performing ANY of these actions, you MUST call `check-action` first:
 ### How to Check
 
 ```bash
-SCRIPT_DIR="$HOME/.openclaw/skills/agent-passport-lite/scripts"
+SCRIPT_DIR="$HOME/.openclaw/skills/agent-passport/scripts"
 
 result=$($SCRIPT_DIR/mandate-ledger.sh check-action "<your_agent_id>" "<category>" "<target>" [amount])
 ```
@@ -54,6 +55,7 @@ result=$($SCRIPT_DIR/mandate-ledger.sh check-action "<your_agent_id>" "<category
 Parse the result:
 - `authorized: true` → proceed, then log the action afterward
 - `authorized: false` → **STOP. Ask the user.**
+- If response includes `kill_switch: true` or reason `Kill switch engaged` → **STOP immediately** and ask user to run `mandate-ledger.sh unlock`
 
 ### The Flow
 
@@ -122,6 +124,20 @@ $SCRIPT_DIR/mandate-ledger.sh log-action "<mandate_id>" <amount> "<description>"
 - For everything else: amount = 1
 - Description should be human-readable: "Sent email to bob@company.com re: Q1 report"
 
+### Kill Switch Behavior
+
+If the user engages the kill switch, all operations are frozen until unlocked.
+
+```bash
+./mandate-ledger.sh kill "user requested freeze"
+./mandate-ledger.sh unlock
+```
+
+Agent behavior when kill switch is active:
+- Do not attempt sensitive actions
+- Do not retry `check-action` in a loop
+- Tell user operations are blocked and request explicit `unlock`
+
 ---
 
 ## Overview
@@ -175,6 +191,11 @@ Allowlists and deny lists support three wildcard styles:
 ./mandate-ledger.sh create-from-template email-team <domain>
 ./mandate-ledger.sh create-from-template file-ops <path>
 ./mandate-ledger.sh create-from-template web-research
+./mandate-ledger.sh create-from-template safe-browsing
+./mandate-ledger.sh create-from-template coding
+./mandate-ledger.sh create-from-template email-assistant
+./mandate-ledger.sh create-from-template read-only
+./mandate-ledger.sh create-from-template full-auto
 
 # Quick create (human-friendly durations: 7d, 24h, 30m)
 ./mandate-ledger.sh create-quick <type> <agent_id> <allowlist_csv> <duration> [amount_cap]
@@ -217,6 +238,8 @@ check-action <agent> <type> <target> [amount]
                            # Check if action is authorized
 log-action <mandate_id> <amount> [description]
                            # Log action against mandate
+kill <reason>               # Engage kill switch and freeze execution
+unlock                      # Disengage kill switch
 ```
 
 ### Audit & Reporting
@@ -277,7 +300,7 @@ Export local ledger anytime: `./mandate-ledger.sh export > backup.json`
 {
   "skills": {
     "entries": {
-      "agent-passport-lite": {
+      "agent-passport": {
         "env": {
           "AGENT_PASSPORT_LOCAL_LEDGER": "true"
         },

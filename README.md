@@ -1,4 +1,4 @@
-# Agent Passport Lite
+# Agent Passport
 
 **OAuth for the agentic era** — consent-gating for ALL sensitive agent actions.
 
@@ -14,7 +14,7 @@
 # That's it! The agent will now check permissions before sensitive actions.
 ```
 
-> **Templates available:** `dev-tools` · `email-team <domain>` · `file-ops <path>` · `web-research`
+> **Templates available:** `dev-tools` · `email-team <domain>` · `file-ops <path>` · `web-research` · `safe-browsing` · `coding` · `email-assistant` · `read-only` · `full-auto`
 > Run `./mandate-ledger.sh templates` to see all options.
 
 ## The Problem
@@ -143,6 +143,29 @@ $ ./mandate-ledger.sh audit
 2. **Preview** — Validation only, no storage
 3. **Live (roadmap)** — Future connection to Agent Bridge for multi-agent sync (not yet implemented)
 
+## Templates
+
+- `dev-tools` - System dev commands with deny list protections, TTL 30d
+- `email-team <domain>` - Communication scoped to `*@domain`, rate 50/day, TTL 30d
+- `file-ops <path>` - Data operations in a path with secret/git denies, TTL 30d
+- `web-research` - External API access to common model/dev APIs, rate 200/hour, TTL 30d
+- `safe-browsing` - `external_api`, allowlist `google.com wikipedia.org github.com stackoverflow.com`, rate 30/hour, TTL 24h
+- `coding` - `system`, allowlist `git npm node python pip cargo make docker`, rate 100/hour, TTL 7d
+- `email-assistant` - `communication`, allowlist `all`, rate 20/hour, amount_cap 0, TTL 24h
+- `read-only` - `data`, allowlist `read list cat ls`, rate 50/hour, TTL 24h
+- `full-auto` - `system`, allowlist `all`, rate 200/hour, TTL 1d
+
+## Kill Switch
+
+Immediate freeze/unfreeze for all ledger operations:
+
+```bash
+./mandate-ledger.sh kill "suspicious behavior"
+./mandate-ledger.sh unlock
+```
+
+When engaged, all commands are denied except `unlock`.
+
 ## Commands
 
 ```bash
@@ -168,6 +191,10 @@ kya-register <agent_id> <principal> <scope> [provider]
 kya-get <agent_id>
 kya-list
 kya-revoke <agent_id> [why]
+
+# Safety
+kill <reason>              # Engage kill switch (freeze execution)
+unlock                     # Disengage kill switch
 ```
 
 ## Agent Bridge (Coming Soon)
@@ -194,7 +221,7 @@ Or in OpenClaw config:
 {
   "skills": {
     "entries": {
-      "agent-passport-lite": {
+      "agent-passport": {
         "env": {
           "AGENT_PASSPORT_LOCAL_LEDGER": "true"
         }
