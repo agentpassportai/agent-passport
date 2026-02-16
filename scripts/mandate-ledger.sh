@@ -512,12 +512,25 @@ spend() {
 
 export_ledger() {
     init_ledger
-    local mandates agents audit
+    local mandates agents audit kya_present audit_present
     mandates="$(jq '.mandates' "$LEDGER_FILE")"
-    agents="$(jq '.agents' "$KYA_FILE" 2>/dev/null || echo '[]')"
-    audit="$(jq '.entries' "$AUDIT_FILE" 2>/dev/null || echo '[]')"
+    kya_present=false
+    audit_present=false
+    if [ -f "$KYA_FILE" ]; then
+        agents="$(jq '.agents' "$KYA_FILE")"
+        kya_present=true
+    else
+        agents='[]'
+    fi
+    if [ -f "$AUDIT_FILE" ]; then
+        audit="$(jq '.entries' "$AUDIT_FILE")"
+        audit_present=true
+    else
+        audit='[]'
+    fi
     jq -n --argjson m "$mandates" --argjson a "$agents" --argjson au "$audit" \
-        '{"mandates": $m, "agents": $a, "audit": $au, "version": "2.1.0", "exported_at": (now | todate)}'
+        --argjson kp "$kya_present" --argjson ap "$audit_present" \
+        '{"mandates": $m, "agents": $a, "audit": $au, "kya_present": $kp, "audit_present": $ap, "version": "2.1.0", "exported_at": (now | todate)}'
 }
 
 # Audit commands
