@@ -1,0 +1,43 @@
+name: Feature Request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before submitting, check the [roadmap](https://github.com/agentpassportai/agent-passport/blob/main/SKILL.md) to see if this is already planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation or limitation you're running into.
+      placeholder: Right now I can't do X because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like to see added or changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any other approaches you thought about?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Agent Passport has a few hard design goals. Please confirm this request fits.
+      options:
+        - label: No external dependencies (zero-dep is a design goal)
+        - label: Backward compatible with existing mandate schemas
+        - label: Works offline (no network required for core consent-gating)
