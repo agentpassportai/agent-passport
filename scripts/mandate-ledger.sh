@@ -1,7 +1,7 @@
 #!/bin/bash
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
-# v2.2.0: SSRF Shield, Path Traversal Guard, Webhook Origin Verification
+# v2.2.1: SSRF Shield, Path Traversal Guard, Webhook Origin Verification
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
@@ -20,7 +20,7 @@ KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 init_ledger() {
     mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.2.0"}' > "$LEDGER_FILE"
+        echo '{"mandates":[],"version":"2.2.1"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
         echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
@@ -46,7 +46,8 @@ check_ssrf() {
     local url="$1"
 
     if [ -z "$url" ]; then
-        echo '{"ssrf_safe": false, "reason": "No URL provided", "target": ""}'
+        jq -n --arg target "" --arg reason "No URL provided" \
+            '{ssrf_safe: false, reason: $reason, target: $target}'
         return 0
     fi
 
@@ -54,20 +55,23 @@ check_ssrf() {
     local scheme
     scheme=$(echo "$url" | grep -oP '^[a-zA-Z][a-zA-Z0-9+\-.]*(?=://)' | tr '[:upper:]' '[:lower:]')
     if [ -z "$scheme" ]; then
-        echo '{"ssrf_safe": false, "reason": "Invalid URL: no scheme detected", "target": "'"$url"'"}'
+        jq -n --arg target "$url" --arg reason "Invalid URL: no scheme detected" \
+            '{ssrf_safe: false, reason: $reason, target: $target}'
         return 0
     fi
     case "$scheme" in
         http|https) ;;
         *)
-            echo '{"ssrf_safe": false, "reason": "Blocked scheme '"'"''"$scheme"'://'"'"': only http/https allowed", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Blocked scheme '${scheme}://': only http/https allowed" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
             ;;
     esac
 
     # Reject embedded credentials (user:pass@host)
     if echo "$url" | grep -qP '^https?://[^@/]+:[^@/]+@'; then
-        echo '{"ssrf_safe": false, "reason": "Embedded credentials in URL are not allowed", "target": "'"$url"'"}'
+        jq -n --arg target "$url" --arg reason "Embedded credentials in URL are not allowed" \
+            '{ssrf_safe: false, reason: $reason, target: $target}'
         return 0
     fi
 
@@ -75,14 +79,16 @@ check_ssrf() {
     local hostname
     hostname=$(echo "$url" | grep -oP '(?<=://)[^/:@?#]+' | head -1 | tr '[:upper:]' '[:lower:]')
     if [ -z "$hostname" ]; then
-        echo '{"ssrf_safe": false, "reason": "Could not extract hostname from URL", "target": "'"$url"'"}'
+        jq -n --arg target "$url" --arg reason "Could not extract hostname from URL" \
+            '{ssrf_safe: false, reason: $reason, target: $target}'
         return 0
     fi
 
     # Block localhost variants
     case "$hostname" in
         localhost|localhost.localdomain|ip6-localhost|ip6-loopback)
-            echo '{"ssrf_safe": false, "reason": "Localhost hostname blocked", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Localhost hostname blocked" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
             ;;
     esac
@@ -90,7 +96,8 @@ check_ssrf() {
     # Block cloud metadata endpoints
     case "$hostname" in
         metadata.google.internal|metadata.google|computemetadata.google|"169.254.169.254"|metadata.azure.com|metadata.azure.internal)
-            echo '{"ssrf_safe": false, "reason": "Cloud metadata endpoint blocked: '"$hostname"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Cloud metadata endpoint blocked: $hostname" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
             ;;
     esac
@@ -99,7 +106,8 @@ check_ssrf() {
     local stripped_host="${hostname#[}"
     stripped_host="${stripped_host%]}"
     if [ "$stripped_host" = "::1" ] || [ "$stripped_host" = "0:0:0:0:0:0:0:1" ]; then
-        echo '{"ssrf_safe": false, "reason": "IPv6 loopback blocked", "target": "'"$url"'"}'
+        jq -n --arg target "$url" --arg reason "IPv6 loopback blocked" \
+            '{ssrf_safe: false, reason: $reason, target: $target}'
         return 0
     fi
 
@@ -112,37 +120,44 @@ check_ssrf() {
 
         # 0.0.0.0 — unspecified
         if [ "$ip" = "0.0.0.0" ]; then
-            echo '{"ssrf_safe": false, "reason": "Unspecified address 0.0.0.0 blocked", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Unspecified address 0.0.0.0 blocked" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
         # 127.x.x.x — loopback
         if [ "$o1" -eq 127 ]; then
-            echo '{"ssrf_safe": false, "reason": "Loopback IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Loopback IP blocked: $ip" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
         # 10.x.x.x — private class A
         if [ "$o1" -eq 10 ]; then
-            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Private network IP blocked: $ip" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
         # 172.16.0.0/12 — private class B
         if [ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]; then
-            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Private network IP blocked: $ip" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
         # 192.168.x.x — private class C
         if [ "$o1" -eq 192 ] && [ "$o2" -eq 168 ]; then
-            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Private network IP blocked: $ip" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
         # 169.254.x.x — link-local / AWS IMDS
         if [ "$o1" -eq 169 ] && [ "$o2" -eq 254 ]; then
-            echo '{"ssrf_safe": false, "reason": "Link-local/IMDS IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            jq -n --arg target "$url" --arg reason "Link-local/IMDS IP blocked: $ip" \
+                '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
         fi
     fi
 
-    echo '{"ssrf_safe": true, "reason": "URL passed all SSRF checks", "target": "'"$url"'"}'
+    jq -n --arg target "$url" --arg reason "URL passed all SSRF checks" \
+        '{ssrf_safe: true, reason: $reason, target: $target}'
 }
 
 # ─── Path Traversal Guard ─────────────────────────────────────────────────────
@@ -153,13 +168,15 @@ check_path() {
     local safe_root="${2:-}"
 
     if [ -z "$path" ]; then
-        echo '{"path_safe": false, "canonical_path": "", "reason": "No path provided"}'
+        jq -n --arg canonical_path "" --arg reason "No path provided" \
+            '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
         return 0
     fi
 
     # Block null bytes
     if printf '%s' "$path" | grep -qP '\x00'; then
-        echo '{"path_safe": false, "canonical_path": "", "reason": "Null byte in path"}'
+        jq -n --arg canonical_path "" --arg reason "Null byte in path" \
+            '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
         return 0
     fi
 
@@ -168,7 +185,8 @@ check_path() {
     decoded=$(echo "$decoded" | sed 's/%252e%252e/\.\./gi; s/%2e%2e/\.\./gi; s/%2f/\//gi; s/%5c/\//gi; s/%252f/\//gi' 2>/dev/null || echo "$decoded")
 
     if echo "$decoded" | grep -qP '(\.\./|/\.\.|^\.\.$)'; then
-        echo '{"path_safe": false, "canonical_path": "", "reason": "Path traversal sequence detected"}'
+        jq -n --arg canonical_path "" --arg reason "Path traversal sequence detected" \
+            '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
         return 0
     fi
 
@@ -187,13 +205,15 @@ check_path() {
     fi
 
     if [ -z "$canonical" ]; then
-        echo '{"path_safe": false, "canonical_path": "", "reason": "Path canonicalization failed"}'
+        jq -n --arg canonical_path "" --arg reason "Path canonicalization failed" \
+            '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
         return 0
     fi
 
     # If no safe_root, just validate no traversal occurred
     if [ -z "$safe_root" ]; then
-        echo "{\"path_safe\": true, \"canonical_path\": \"$canonical\", \"reason\": \"Path is clean (no safe_root constraint)\"}"
+        jq -n --arg canonical_path "$canonical" --arg reason "Path is clean (no safe_root constraint)" \
+            '{path_safe: true, canonical_path: $canonical_path, reason: $reason}'
         return 0
     fi
 
@@ -207,9 +227,11 @@ check_path() {
 
     # Ensure canonical starts with canonical_root + / (or equals it)
     if [ "$canonical" = "$canonical_root" ] || [[ "$canonical" == "$canonical_root/"* ]]; then
-        echo "{\"path_safe\": true, \"canonical_path\": \"$canonical\", \"reason\": \"Path is within safe root\"}"
+        jq -n --arg canonical_path "$canonical" --arg reason "Path is within safe root" \
+            '{path_safe: true, canonical_path: $canonical_path, reason: $reason}'
     else
-        echo "{\"path_safe\": false, \"canonical_path\": \"$canonical\", \"reason\": \"Path escapes safe root: $canonical_root\"}"
+        jq -n --arg canonical_path "$canonical" --arg reason "Path escapes safe root: $canonical_root" \
+            '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
     fi
 }
 
@@ -224,7 +246,8 @@ verify_webhook() {
     local hmac_body="${5:-}"
 
     if [ -z "$origin" ] || [ -z "$domains_csv" ]; then
-        echo '{"webhook_valid": false, "origin_valid": false, "signature_valid": false, "reason": "Missing origin or allowed domains"}'
+        jq -n --arg reason "Missing origin or allowed domains" \
+            '{webhook_valid: false, origin_valid: false, signature_valid: false, reason: $reason}'
         return 0
     fi
 
@@ -237,7 +260,8 @@ verify_webhook() {
     fi
 
     if [ -z "$origin_host" ]; then
-        echo '{"webhook_valid": false, "origin_valid": false, "signature_valid": false, "reason": "Could not parse origin hostname"}'
+        jq -n --arg reason "Could not parse origin hostname" \
+            '{webhook_valid: false, origin_valid: false, signature_valid: false, reason: $reason}'
         audit_log "webhook_verify" "system" "origin: $origin" "error: unparseable origin"
         return 0
     fi
@@ -277,7 +301,8 @@ verify_webhook() {
                 signature_valid=true
             fi
         else
-            echo '{"webhook_valid": false, "origin_valid": '"$origin_valid"', "signature_valid": false, "reason": "openssl unavailable for HMAC verification"}'
+            jq -n --argjson origin_valid "$origin_valid" --arg reason "openssl unavailable for HMAC verification" \
+                '{webhook_valid: false, origin_valid: $origin_valid, signature_valid: false, reason: $reason}'
             audit_log "webhook_verify" "system" "origin: $origin" "error: openssl unavailable"
             return 0
         fi
@@ -304,7 +329,12 @@ verify_webhook() {
 
     audit_log "webhook_verify" "system" "origin: $origin" "$reason"
 
-    echo "{\"webhook_valid\": $overall_valid, \"origin_valid\": $origin_valid, \"signature_valid\": $signature_valid, \"reason\": \"$reason\"}"
+    jq -n \
+        --argjson webhook_valid "$overall_valid" \
+        --argjson origin_valid "$origin_valid" \
+        --argjson signature_valid "$signature_valid" \
+        --arg reason "$reason" \
+        '{webhook_valid: $webhook_valid, origin_valid: $origin_valid, signature_valid: $signature_valid, reason: $reason}'
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -369,7 +399,8 @@ create_mandate() {
     
     # Reject expired TTL
     if [[ "$ttl" < "$now" ]]; then
-        echo "{\"error\": \"TTL is already expired\", \"ttl\": \"$ttl\"}"
+        jq -n --arg error "TTL is already expired" --arg ttl "$ttl" \
+            '{error: $error, ttl: $ttl}'
         return 1
     fi
     
@@ -447,7 +478,8 @@ check_action() {
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     if kill_switch_engaged; then
-        echo '{"authorized": false, "reason": "Kill switch engaged", "kill_switch": true}'
+        jq -n --arg reason "Kill switch engaged" \
+            '{authorized: false, reason: $reason, kill_switch: true}'
         return 0
     fi
 
@@ -461,7 +493,11 @@ check_action() {
             local ssrf_reason
             ssrf_reason=$(echo "$ssrf_result" | jq -r '.reason // "SSRF check failed"')
             audit_log "ssrf_block" "$agent_id" "target: $target" "blocked: $ssrf_reason"
-            echo "{\"authorized\": false, \"action_type\": \"$action_type\", \"target\": \"$target\", \"reason\": \"SSRF Shield: $ssrf_reason\", \"ssrf_blocked\": true}"
+            jq -n \
+                --arg action_type "$action_type" \
+                --arg target "$target" \
+                --arg reason "SSRF Shield: $ssrf_reason" \
+                '{authorized: false, action_type: $action_type, target: $target, reason: $reason, ssrf_blocked: true}'
             return 0
         fi
     fi
@@ -476,13 +512,22 @@ check_action() {
             local path_reason
             path_reason=$(echo "$path_result" | jq -r '.reason // "Path traversal check failed"')
             audit_log "path_traversal_block" "$agent_id" "target: $target" "blocked: $path_reason"
-            echo "{\"authorized\": false, \"action_type\": \"$action_type\", \"target\": \"$target\", \"reason\": \"Path Traversal Guard: $path_reason\", \"path_blocked\": true}"
+            jq -n \
+                --arg action_type "$action_type" \
+                --arg target "$target" \
+                --arg reason "Path Traversal Guard: $path_reason" \
+                '{authorized: false, action_type: $action_type, target: $target, reason: $reason, path_blocked: true}'
             return 0
         fi
     fi
 
     # Default amount to 1 for non-financial
     amount="${amount:-1}"
+
+    if ! [[ "$amount" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        jq -n '{error: "Invalid amount: must be a non-negative number"}'
+        return 1
+    fi
     
     # Check if ledger is completely empty
     local total_mandates=$(jq '.mandates | length' "$LEDGER_FILE")
@@ -573,9 +618,26 @@ check_action() {
             remaining=$(echo "$cap - $used" | bc)
         fi
         
-        echo '{"authorized": true, "mandate_id": "'"$mandate_id"'", "action_type": "'"$action_type"'", "target": "'"$target"'"'"$([ -n "$remaining" ] && echo ', "remaining": '$remaining)"'}'
+        if [ -n "$remaining" ]; then
+            jq -n \
+                --arg mandate_id "$mandate_id" \
+                --arg action_type "$action_type" \
+                --arg target "$target" \
+                --argjson remaining "$remaining" \
+                '{authorized: true, mandate_id: $mandate_id, action_type: $action_type, target: $target, remaining: $remaining}'
+        else
+            jq -n \
+                --arg mandate_id "$mandate_id" \
+                --arg action_type "$action_type" \
+                --arg target "$target" \
+                '{authorized: true, mandate_id: $mandate_id, action_type: $action_type, target: $target}'
+        fi
     else
-        echo '{"authorized": false, "action_type": "'"$action_type"'", "target": "'"$target"'", "reason": "No valid mandate found"}'
+        jq -n \
+            --arg action_type "$action_type" \
+            --arg target "$target" \
+            --arg reason "No valid mandate found" \
+            '{authorized: false, action_type: $action_type, target: $target, reason: $reason}'
     fi
 }
 
@@ -591,6 +653,11 @@ log_action() {
     local amount="${2:-1}"
     local description="${3:-action performed}"
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if ! [[ "$amount" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        jq -n '{error: "Invalid amount: must be a non-negative number"}'
+        return 1
+    fi
     
     # Get current mandate
     local mandate=$(jq -c --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")
@@ -605,12 +672,14 @@ log_action() {
     local action_type=$(echo "$mandate" | jq -r '.action_type')
     
     if [ "$status" != "active" ]; then
-        echo '{"error": "Mandate not active", "status": "'"$status"'"}'
+        jq -n --arg error "Mandate not active" --arg status "$status" \
+            '{error: $error, status: $status}'
         return 1
     fi
     
     if [[ "$ttl" < "$now" ]]; then
-        echo '{"error": "Mandate expired", "ttl": "'"$ttl"'"}'
+        jq -n --arg error "Mandate expired" --arg ttl "$ttl" \
+            '{error: $error, ttl: $ttl}'
         return 1
     fi
     
@@ -621,7 +690,12 @@ log_action() {
         local new_used=$(echo "$used + $amount" | bc)
         
         if (( $(echo "$new_used > $cap" | bc -l) )); then
-            echo '{"error": "Exceeds cap", "cap": '$cap', "used": '$used', "requested": '$amount'}'
+            jq -n \
+                --arg error "Exceeds cap" \
+                --argjson cap "$cap" \
+                --argjson used "$used" \
+                --argjson requested "$amount" \
+                '{error: $error, cap: $cap, used: $used, requested: $requested}'
             return 1
         fi
     fi
@@ -632,7 +706,11 @@ log_action() {
         local limit_count=$(echo "$rate_limit" | cut -d'/' -f1)
         local current_count=$(echo "$mandate" | jq -r '.usage.count // 0')
         if (( current_count >= limit_count )); then
-            echo '{"error": "Rate limit exceeded", "limit": "'"$rate_limit"'", "current": '$current_count'}'
+            jq -n \
+                --arg error "Rate limit exceeded" \
+                --arg limit "$rate_limit" \
+                --argjson current "$current_count" \
+                '{error: $error, limit: $limit, current: $current}'
             return 1
         fi
     fi
@@ -651,7 +729,12 @@ log_action() {
     
     audit_log "action" "$id" "$description" "success"
     
-    echo '{"success": true, "mandate_id": "'"$id"'", "action_type": "'"$action_type"'", "usage": {"count": '$new_count', "total_amount": '$new_total'}}'
+    jq -n \
+        --arg mandate_id "$id" \
+        --arg action_type "$action_type" \
+        --argjson count "$new_count" \
+        --argjson total_amount "$new_total" \
+        '{success: true, mandate_id: $mandate_id, action_type: $action_type, usage: {count: $count, total_amount: $total_amount}}'
 }
 
 # Legacy spend for backwards compatibility
@@ -788,7 +871,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.2.0"
+    echo "Agent Passport Local Ledger v2.2.1"
     echo "================================="
     echo ""
     
@@ -1075,7 +1158,7 @@ create_quick() {
     
     local ttl=$(parse_ttl_duration "$ttl_duration")
     if [ $? -ne 0 ] || [ -z "$ttl" ]; then
-        echo '{"error": "Invalid TTL duration: '"$ttl_duration"'. Use e.g. 7d, 24h, 30m"}'
+        jq -n --arg error "Invalid TTL duration: $ttl_duration. Use e.g. 7d, 24h, 30m" '{error: $error}'
         return 1
     fi
     
@@ -1314,7 +1397,7 @@ case "$1" in
         unlock_ledger
         ;;
     *)
-        echo "Agent Passport - Local Mandate Ledger v2.2.0"
+        echo "Agent Passport - Local Mandate Ledger v2.2.1"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -1367,7 +1450,7 @@ case "$1" in
         echo "  kill <reason>                           Engage kill switch and freeze execution"
         echo "  unlock                                  Disengage kill switch and resume execution"
         echo ""
-        echo "SECURITY (v2.2.0):"
+        echo "SECURITY (v2.2.1):"
         echo "  check-ssrf <url>                        SSRF Shield: validate URL is safe to fetch"
         echo "  check-path <path> [safe_root]           Path Traversal Guard: validate file path"
         echo "  verify-webhook <origin> <domains_csv>   Webhook Origin Verification (+ optional HMAC)"
