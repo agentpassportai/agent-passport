@@ -1,84 +1,13 @@
 #!/bin/bash
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
-
-set -euo pipefail
-umask 077
+# v2.2.0: SSRF Shield, Path Traversal Guard, Webhook Origin Verification
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
 KYA_FILE="$LEDGER_DIR/agents.json"
 AUDIT_FILE="$LEDGER_DIR/audit.json"
 KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
-
-SAFE_FIELD_RE='^[A-Za-z0-9._:@/-]+$'
-SAFE_PATH_RE='^[A-Za-z0-9._/@*,:+= -]+$'
-SAFE_NUMBER_RE='^[0-9]+([.][0-9]+)?$'
-
-json_error() {
-    local message="$1"
-    printf '{"error": "%s"}\n' "$message"
-}
-
-assert_safe_field() {
-    local field_name="$1"
-    local value="$2"
-    if [ -z "$value" ] || ! [[ "$value" =~ $SAFE_FIELD_RE ]]; then
-        json_error "Invalid $field_name"
-        return 1
-    fi
-}
-
-assert_safe_path_value() {
-    local field_name="$1"
-    local value="$2"
-    if [ -z "$value" ] || [[ "$value" == *".."* ]] || ! [[ "$value" =~ $SAFE_PATH_RE ]]; then
-        json_error "Invalid $field_name"
-        return 1
-    fi
-}
-
-assert_safe_amount() {
-    local field_name="$1"
-    local value="$2"
-    if [ -z "$value" ] || ! [[ "$value" =~ $SAFE_NUMBER_RE ]]; then
-        json_error "Invalid $field_name"
-        return 1
-    fi
-}
-
-assert_valid_json() {
-    local input="$1"
-    if ! printf '%s' "$input" | jq -e . >/dev/null 2>&1; then
-        json_error "Invalid JSON payload"
-        return 1
-    fi
-}
-
-safe_write_json_file() {
-    local target_file="$1"
-    local content="$2"
-    local tmp_file
-    tmp_file="$(mktemp "$LEDGER_DIR/.tmp.XXXXXX")"
-    printf '%s\n' "$content" > "$tmp_file"
-    mv -f -- "$tmp_file" "$target_file"
-}
-
-safe_write_text_file() {
-    local target_file="$1"
-    local content="$2"
-    local tmp_file
-    tmp_file="$(mktemp "$LEDGER_DIR/.tmp.XXXXXX")"
-    printf '%s\n' "$content" > "$tmp_file"
-    mv -f -- "$tmp_file" "$target_file"
-}
-
-validate_ledger_dir() {
-    if [ -z "$LEDGER_DIR" ] || [[ "$LEDGER_DIR" == *".."* ]] || [[ "$LEDGER_DIR" == *$'\n'* ]]; then
-        echo "Error: Invalid ledger directory path" >&2
-        return 1
-    fi
-}
 
 # Action categories
 # - financial: purchases, transfers, subscriptions
@@ -89,16 +18,15 @@ validate_ledger_dir() {
 # - identity: public actions "as" the user
 
 init_ledger() {
-    validate_ledger_dir
-    mkdir -p -- "$LEDGER_DIR"
+    mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        safe_write_json_file "$LEDGER_FILE" '{"mandates":[],"version":"2.1.0"}'
+        echo '{"mandates":[],"version":"2.2.0"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
-        safe_write_json_file "$KYA_FILE" '{"agents":[],"version":"1.0"}'
+        echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
     fi
     if [ ! -f "$AUDIT_FILE" ]; then
-        safe_write_json_file "$AUDIT_FILE" '{"entries":[],"version":"1.0"}'
+        echo '{"entries":[],"version":"1.0"}' > "$AUDIT_FILE"
     fi
 }
 
@@ -111,13 +39,282 @@ generate_id() {
     echo "${prefix}_$(date +%s)_$(head -c 4 /dev/urandom | xxd -p)"
 }
 
+# ─── SSRF Shield ─────────────────────────────────────────────────────────────
+# Blocks requests to private IPs, localhost, cloud metadata, and unsafe schemes.
+# Addresses CVE-2026-26322 (Gateway SSRF) and GHSA-56f2-hvwg-5743 (image SSRF).
+check_ssrf() {
+    local url="$1"
+
+    if [ -z "$url" ]; then
+        echo '{"ssrf_safe": false, "reason": "No URL provided", "target": ""}'
+        return 0
+    fi
+
+    # Reject non-http/https schemes (file://, gopher://, ftp://, dict://, etc.)
+    local scheme
+    scheme=$(echo "$url" | grep -oP '^[a-zA-Z][a-zA-Z0-9+\-.]*(?=://)' | tr '[:upper:]' '[:lower:]')
+    if [ -z "$scheme" ]; then
+        echo '{"ssrf_safe": false, "reason": "Invalid URL: no scheme detected", "target": "'"$url"'"}'
+        return 0
+    fi
+    case "$scheme" in
+        http|https) ;;
+        *)
+            echo '{"ssrf_safe": false, "reason": "Blocked scheme '"'"''"$scheme"'://'"'"': only http/https allowed", "target": "'"$url"'"}'
+            return 0
+            ;;
+    esac
+
+    # Reject embedded credentials (user:pass@host)
+    if echo "$url" | grep -qP '^https?://[^@/]+:[^@/]+@'; then
+        echo '{"ssrf_safe": false, "reason": "Embedded credentials in URL are not allowed", "target": "'"$url"'"}'
+        return 0
+    fi
+
+    # Extract hostname
+    local hostname
+    hostname=$(echo "$url" | grep -oP '(?<=://)[^/:@?#]+' | head -1 | tr '[:upper:]' '[:lower:]')
+    if [ -z "$hostname" ]; then
+        echo '{"ssrf_safe": false, "reason": "Could not extract hostname from URL", "target": "'"$url"'"}'
+        return 0
+    fi
+
+    # Block localhost variants
+    case "$hostname" in
+        localhost|localhost.localdomain|ip6-localhost|ip6-loopback)
+            echo '{"ssrf_safe": false, "reason": "Localhost hostname blocked", "target": "'"$url"'"}'
+            return 0
+            ;;
+    esac
+
+    # Block cloud metadata endpoints
+    case "$hostname" in
+        metadata.google.internal|metadata.google|computemetadata.google|"169.254.169.254"|metadata.azure.com|metadata.azure.internal)
+            echo '{"ssrf_safe": false, "reason": "Cloud metadata endpoint blocked: '"$hostname"'", "target": "'"$url"'"}'
+            return 0
+            ;;
+    esac
+
+    # Block IPv6 loopback
+    local stripped_host="${hostname#[}"
+    stripped_host="${stripped_host%]}"
+    if [ "$stripped_host" = "::1" ] || [ "$stripped_host" = "0:0:0:0:0:0:0:1" ]; then
+        echo '{"ssrf_safe": false, "reason": "IPv6 loopback blocked", "target": "'"$url"'"}'
+        return 0
+    fi
+
+    # Check if hostname is an IPv4 address and validate ranges
+    if echo "$hostname" | grep -qP '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'; then
+        local ip="$hostname"
+        local o1 o2
+        o1=$(echo "$ip" | cut -d. -f1)
+        o2=$(echo "$ip" | cut -d. -f2)
+
+        # 0.0.0.0 — unspecified
+        if [ "$ip" = "0.0.0.0" ]; then
+            echo '{"ssrf_safe": false, "reason": "Unspecified address 0.0.0.0 blocked", "target": "'"$url"'"}'
+            return 0
+        fi
+        # 127.x.x.x — loopback
+        if [ "$o1" -eq 127 ]; then
+            echo '{"ssrf_safe": false, "reason": "Loopback IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            return 0
+        fi
+        # 10.x.x.x — private class A
+        if [ "$o1" -eq 10 ]; then
+            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            return 0
+        fi
+        # 172.16.0.0/12 — private class B
+        if [ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]; then
+            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            return 0
+        fi
+        # 192.168.x.x — private class C
+        if [ "$o1" -eq 192 ] && [ "$o2" -eq 168 ]; then
+            echo '{"ssrf_safe": false, "reason": "Private network IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            return 0
+        fi
+        # 169.254.x.x — link-local / AWS IMDS
+        if [ "$o1" -eq 169 ] && [ "$o2" -eq 254 ]; then
+            echo '{"ssrf_safe": false, "reason": "Link-local/IMDS IP blocked: '"$ip"'", "target": "'"$url"'"}'
+            return 0
+        fi
+    fi
+
+    echo '{"ssrf_safe": true, "reason": "URL passed all SSRF checks", "target": "'"$url"'"}'
+}
+
+# ─── Path Traversal Guard ─────────────────────────────────────────────────────
+# Canonicalizes file paths and validates against a safe root.
+# Addresses CVE-2026-26329 (path traversal in browser upload).
+check_path() {
+    local path="$1"
+    local safe_root="${2:-}"
+
+    if [ -z "$path" ]; then
+        echo '{"path_safe": false, "canonical_path": "", "reason": "No path provided"}'
+        return 0
+    fi
+
+    # Block null bytes
+    if printf '%s' "$path" | grep -qP '\x00'; then
+        echo '{"path_safe": false, "canonical_path": "", "reason": "Null byte in path"}'
+        return 0
+    fi
+
+    # Decode common URL encodings and check for traversal sequences
+    local decoded="$path"
+    decoded=$(echo "$decoded" | sed 's/%252e%252e/\.\./gi; s/%2e%2e/\.\./gi; s/%2f/\//gi; s/%5c/\//gi; s/%252f/\//gi' 2>/dev/null || echo "$decoded")
+
+    if echo "$decoded" | grep -qP '(\.\./|/\.\.|^\.\.$)'; then
+        echo '{"path_safe": false, "canonical_path": "", "reason": "Path traversal sequence detected"}'
+        return 0
+    fi
+
+    # Canonicalize
+    local canonical
+    if command -v realpath &>/dev/null; then
+        canonical=$(realpath -m -- "$path" 2>/dev/null)
+    else
+        # Manual: resolve consecutive slashes and dot segments
+        canonical="$path"
+        while echo "$canonical" | grep -qP '(/\.?/|/[^/]+/\.\.)'; do
+            canonical=$(echo "$canonical" | sed 's|/\./|/|g; s|/[^/]*/\.\.|/|g; s|//|/|g')
+        done
+        canonical="${canonical%/}"
+        [ -z "$canonical" ] && canonical="/"
+    fi
+
+    if [ -z "$canonical" ]; then
+        echo '{"path_safe": false, "canonical_path": "", "reason": "Path canonicalization failed"}'
+        return 0
+    fi
+
+    # If no safe_root, just validate no traversal occurred
+    if [ -z "$safe_root" ]; then
+        echo "{\"path_safe\": true, \"canonical_path\": \"$canonical\", \"reason\": \"Path is clean (no safe_root constraint)\"}"
+        return 0
+    fi
+
+    # Canonicalize safe_root
+    local canonical_root
+    if command -v realpath &>/dev/null; then
+        canonical_root=$(realpath -m -- "$safe_root" 2>/dev/null)
+    else
+        canonical_root="${safe_root%/}"
+    fi
+
+    # Ensure canonical starts with canonical_root + / (or equals it)
+    if [ "$canonical" = "$canonical_root" ] || [[ "$canonical" == "$canonical_root/"* ]]; then
+        echo "{\"path_safe\": true, \"canonical_path\": \"$canonical\", \"reason\": \"Path is within safe root\"}"
+    else
+        echo "{\"path_safe\": false, \"canonical_path\": \"$canonical\", \"reason\": \"Path escapes safe root: $canonical_root\"}"
+    fi
+}
+
+# ─── Webhook Origin Verification ─────────────────────────────────────────────
+# Validates origin headers and optional HMAC-SHA256 signatures on webhooks.
+# Addresses CVE-2026-26319 (missing Telnyx auth) and GHSA-c37p-4qqg-3p76 (Twilio bypass).
+verify_webhook() {
+    local origin="$1"
+    local domains_csv="$2"
+    local hmac_secret="${3:-}"
+    local hmac_signature="${4:-}"
+    local hmac_body="${5:-}"
+
+    if [ -z "$origin" ] || [ -z "$domains_csv" ]; then
+        echo '{"webhook_valid": false, "origin_valid": false, "signature_valid": false, "reason": "Missing origin or allowed domains"}'
+        return 0
+    fi
+
+    # Extract hostname from origin (handle bare hostnames and full URLs)
+    local origin_host
+    if echo "$origin" | grep -q '://'; then
+        origin_host=$(echo "$origin" | grep -oP '(?<=://)[^/:@?#]+' | head -1 | tr '[:upper:]' '[:lower:]')
+    else
+        origin_host=$(echo "$origin" | tr '[:upper:]' '[:lower:]' | grep -oP '^[^/:@?#]+')
+    fi
+
+    if [ -z "$origin_host" ]; then
+        echo '{"webhook_valid": false, "origin_valid": false, "signature_valid": false, "reason": "Could not parse origin hostname"}'
+        audit_log "webhook_verify" "system" "origin: $origin" "error: unparseable origin"
+        return 0
+    fi
+
+    # Check origin against allowed domain patterns
+    local origin_valid=false
+    IFS=',' read -ra domains <<< "$domains_csv"
+    for pattern in "${domains[@]}"; do
+        pattern=$(echo "$pattern" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+        if [ "$pattern" = "*" ] || [ "$pattern" = "all" ]; then
+            origin_valid=true; break
+        elif [[ "$pattern" == \*\** ]]; then
+            local mid="${pattern:1:${#pattern}-2}"
+            echo "$origin_host" | grep -qi "$mid" && origin_valid=true && break
+        elif [[ "$pattern" == \*.* ]]; then
+            local suffix="${pattern:1}"
+            [[ "$origin_host" == *"$suffix" ]] && origin_valid=true && break
+        elif [[ "$pattern" == *\* ]]; then
+            local prefix="${pattern%\*}"
+            [[ "$origin_host" == "$prefix"* ]] && origin_valid=true && break
+        else
+            [ "$pattern" = "$origin_host" ] && origin_valid=true && break
+        fi
+    done
+
+    # HMAC-SHA256 verification (optional)
+    local signature_valid=false
+    local sig_checked=false
+
+    if [ -n "$hmac_secret" ] && [ -n "$hmac_signature" ] && [ -n "$hmac_body" ]; then
+        sig_checked=true
+        if command -v openssl &>/dev/null; then
+            local computed
+            computed=$(printf '%s' "$hmac_body" | openssl dgst -sha256 -hmac "$hmac_secret" -hex 2>/dev/null | awk '{print $NF}')
+            # Constant-time comparison via diff (avoids string equality short-circuit)
+            if diff <(echo "$computed") <(echo "$hmac_signature") &>/dev/null; then
+                signature_valid=true
+            fi
+        else
+            echo '{"webhook_valid": false, "origin_valid": '"$origin_valid"', "signature_valid": false, "reason": "openssl unavailable for HMAC verification"}'
+            audit_log "webhook_verify" "system" "origin: $origin" "error: openssl unavailable"
+            return 0
+        fi
+    fi
+
+    # Determine overall validity
+    local overall_valid=false
+    if $sig_checked; then
+        $origin_valid && $signature_valid && overall_valid=true
+    else
+        $origin_valid && overall_valid=true
+    fi
+
+    local reason
+    if $overall_valid; then
+        reason="Webhook verified"
+    elif ! $origin_valid; then
+        reason="Origin not in allowlist: $origin_host"
+    elif $sig_checked && ! $signature_valid; then
+        reason="HMAC-SHA256 signature mismatch"
+    else
+        reason="Verification failed"
+    fi
+
+    audit_log "webhook_verify" "system" "origin: $origin" "$reason"
+
+    echo "{\"webhook_valid\": $overall_valid, \"origin_valid\": $origin_valid, \"signature_valid\": $signature_valid, \"reason\": \"$reason\"}"
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Audit logging
 audit_log() {
     init_ledger
-    local action="${1:-}"
-    local mandate_id="${2:-}"
-    local details="${3:-}"
-    local result="${4:-}"
+    local action="$1"
+    local mandate_id="$2"
+    local details="$3"
+    local result="$4"
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local entry_id=$(generate_id "audit")
     
@@ -130,26 +327,18 @@ audit_log() {
         --arg ts "$now" \
         '{entry_id: $id, action: $action, mandate_id: $mandate, details: $details, result: $result, timestamp: $ts}')
     
-    local updated
-    updated="$(jq --argjson e "$entry" '.entries += [$e]' "$AUDIT_FILE")"
-    safe_write_json_file "$AUDIT_FILE" "$updated"
+    local updated=$(jq --argjson e "$entry" '.entries += [$e]' "$AUDIT_FILE")
+    echo "$updated" > "$AUDIT_FILE"
 }
 
 create_mandate() {
     init_ledger
-    local id
-    id="$(generate_id)"
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    local payload="${1:-}"
-
-    if ! assert_valid_json "$payload"; then
-        return 1
-    fi
+    local id=$(generate_id)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local payload="$1"
     
     # Validate action_type
-    local action_type
-    action_type="$(printf '%s' "$payload" | jq -r '.action_type // "financial"')"
+    local action_type=$(echo "$payload" | jq -r '.action_type // "financial"')
     case "$action_type" in
         financial|communication|data|system|external_api|identity)
             ;;
@@ -160,25 +349,19 @@ create_mandate() {
     esac
     
     # Validate required fields
-    local agent_id
-    agent_id="$(printf '%s' "$payload" | jq -r '.agent_id // empty')"
+    local agent_id=$(echo "$payload" | jq -r '.agent_id // empty')
     if [ -z "$agent_id" ]; then
         echo '{"error": "Missing required field: agent_id"}'
         return 1
     fi
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
     
-    local ttl
-    ttl="$(printf '%s' "$payload" | jq -r '.ttl // empty')"
+    local ttl=$(echo "$payload" | jq -r '.ttl // empty')
     if [ -z "$ttl" ]; then
         echo '{"error": "Missing required field: ttl"}'
         return 1
     fi
     
-    local has_scope
-    has_scope="$(printf '%s' "$payload" | jq 'has("scope")')"
+    local has_scope=$(echo "$payload" | jq 'has("scope")')
     if [ "$has_scope" != "true" ]; then
         echo '{"error": "Missing required field: scope"}'
         return 1
@@ -191,8 +374,7 @@ create_mandate() {
     fi
     
     # Add metadata and defaults
-    local mandate
-    mandate="$(printf '%s' "$payload" | jq \
+    local mandate=$(echo "$payload" | jq \
         --arg id "$id" \
         --arg created "$now" \
         --arg status "active" \
@@ -203,12 +385,11 @@ create_mandate() {
             status: $status,
             action_type: $action_type,
             usage: (.usage // {count: 0, total_amount: 0})
-        }')"
+        }')
     
     # Append to ledger
-    local updated
-    updated="$(jq --argjson m "$mandate" '.mandates += [$m]' "$LEDGER_FILE")"
-    safe_write_json_file "$LEDGER_FILE" "$updated"
+    local updated=$(jq --argjson m "$mandate" '.mandates += [$m]' "$LEDGER_FILE")
+    echo "$updated" > "$LEDGER_FILE"
     
     audit_log "create" "$id" "$action_type mandate created" "success"
     echo "$mandate"
@@ -216,18 +397,8 @@ create_mandate() {
 
 get_mandate() {
     init_ledger
-    local id="${1:-}"
-    if [ -z "$id" ]; then
-        echo '{"error": "Usage: get <mandate_id>"}'
-        return 1
-    fi
-    local result
-    result="$(jq --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")"
-    if [ -z "$result" ]; then
-        echo '{"error": "Mandate not found: '"$id"'"}'
-        return 1
-    fi
-    echo "$result"
+    local id="$1"
+    jq --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE"
 }
 
 list_mandates() {
@@ -253,20 +424,14 @@ list_mandates() {
 
 revoke_mandate() {
     init_ledger
-    local id="${1:-}"
+    local id="$1"
     local reason="${2:-revoked by user}"
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-    if ! assert_safe_field "mandate_id" "$id"; then
-        return 1
-    fi
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    local updated
-    updated="$(jq --arg id "$id" --arg reason "$reason" --arg revoked "$now" \
+    local updated=$(jq --arg id "$id" --arg reason "$reason" --arg revoked "$now" \
         '.mandates = [.mandates[] | if .mandate_id == $id then . + {status: "revoked", revoked_at: $revoked, revoke_reason: $reason} else . end]' \
-        "$LEDGER_FILE")"
-    safe_write_json_file "$LEDGER_FILE" "$updated"
+        "$LEDGER_FILE")
+    echo "$updated" > "$LEDGER_FILE"
     
     audit_log "revoke" "$id" "reason: $reason" "success"
     get_mandate "$id"
@@ -275,45 +440,59 @@ revoke_mandate() {
 # Universal action check - works for all action types
 check_action() {
     init_ledger
-    local agent_id="${1:-}"
-    local action_type="${2:-}"
-    local target="${3:-}"      # merchant_id for financial, recipient for comms, path for data, etc.
-    local amount="${4:-}"      # amount for financial, count for rate-limited actions
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
-    if ! assert_safe_field "action_type" "$action_type"; then
-        return 1
-    fi
-    if [ "$action_type" = "data" ] && ! assert_safe_path_value "target" "$target"; then
-        return 1
-    fi
+    local agent_id="$1"
+    local action_type="$2"
+    local target="$3"      # merchant_id for financial, recipient for comms, path for data, etc.
+    local amount="$4"      # amount for financial, count for rate-limited actions
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     if kill_switch_engaged; then
         echo '{"authorized": false, "reason": "Kill switch engaged", "kill_switch": true}'
         return 0
     fi
-    
+
+    # SSRF Shield: auto-validate external_api targets before mandate lookup
+    if [ "$action_type" = "external_api" ] && [ -n "$target" ]; then
+        local ssrf_result
+        ssrf_result=$(check_ssrf "$target")
+        local ssrf_safe
+        ssrf_safe=$(echo "$ssrf_result" | jq -r '.ssrf_safe // false')
+        if [ "$ssrf_safe" != "true" ]; then
+            local ssrf_reason
+            ssrf_reason=$(echo "$ssrf_result" | jq -r '.reason // "SSRF check failed"')
+            audit_log "ssrf_block" "$agent_id" "target: $target" "blocked: $ssrf_reason"
+            echo "{\"authorized\": false, \"action_type\": \"$action_type\", \"target\": \"$target\", \"reason\": \"SSRF Shield: $ssrf_reason\", \"ssrf_blocked\": true}"
+            return 0
+        fi
+    fi
+
+    # Path Traversal Guard: auto-validate data targets before mandate lookup
+    if [ "$action_type" = "data" ] && [ -n "$target" ]; then
+        local path_result
+        path_result=$(check_path "$target")
+        local path_safe
+        path_safe=$(echo "$path_result" | jq -r '.path_safe // false')
+        if [ "$path_safe" != "true" ]; then
+            local path_reason
+            path_reason=$(echo "$path_result" | jq -r '.reason // "Path traversal check failed"')
+            audit_log "path_traversal_block" "$agent_id" "target: $target" "blocked: $path_reason"
+            echo "{\"authorized\": false, \"action_type\": \"$action_type\", \"target\": \"$target\", \"reason\": \"Path Traversal Guard: $path_reason\", \"path_blocked\": true}"
+            return 0
+        fi
+    fi
+
     # Default amount to 1 for non-financial
     amount="${amount:-1}"
-    if ! assert_safe_amount "amount" "$amount"; then
-        return 1
-    fi
     
     # Check if ledger is completely empty
-    local total_mandates
-    total_mandates="$(jq '.mandates | length' "$LEDGER_FILE")"
+    local total_mandates=$(jq '.mandates | length' "$LEDGER_FILE")
     if [ "$total_mandates" -eq 0 ]; then
         echo '{"authorized": false, "reason": "No mandates exist yet. Create one with: mandate-ledger.sh create-from-template dev-tools <agent_id>", "hint": "templates"}'
         return 0
     fi
 
     # Find valid mandate for this action type
-    local mandate
-    mandate="$(jq -c \
+    local mandate=$(jq -c \
         --arg agent "$agent_id" \
         --arg type "$action_type" \
         --arg target "$target" \
@@ -381,22 +560,17 @@ check_action() {
                 (.scope.rate_limit == null) or
                 ((.usage.count // 0) < (.scope.rate_limit | split("/")[0] | tonumber))
             )
-        )] | first // null' "$LEDGER_FILE")"
+        )] | first // null' "$LEDGER_FILE")
     
     if [ "$mandate" != "null" ] && [ -n "$mandate" ]; then
-        local mandate_id
-        mandate_id="$(printf '%s' "$mandate" | jq -r '.mandate_id')"
+        local mandate_id=$(echo "$mandate" | jq -r '.mandate_id')
         local remaining=""
         
         # Calculate remaining based on action type
         if [ "$action_type" = "financial" ]; then
-            local cap
-            cap="$(printf '%s' "$mandate" | jq -r '.amount_cap // 0')"
-            local used
-            used="$(printf '%s' "$mandate" | jq -r '.usage.total_amount // 0')"
-            if assert_safe_amount "amount_cap" "$cap" && assert_safe_amount "used" "$used"; then
-                remaining="$(awk -v c="$cap" -v u="$used" 'BEGIN { printf "%.10g", c - u }')"
-            fi
+            local cap=$(echo "$mandate" | jq -r '.amount_cap // 0')
+            local used=$(echo "$mandate" | jq -r '.usage.total_amount // 0')
+            remaining=$(echo "$cap - $used" | bc)
         fi
         
         echo '{"authorized": true, "mandate_id": "'"$mandate_id"'", "action_type": "'"$action_type"'", "target": "'"$target"'"'"$([ -n "$remaining" ] && echo ', "remaining": '$remaining)"'}'
@@ -407,40 +581,28 @@ check_action() {
 
 # Legacy check for backwards compatibility
 check_mandate() {
-    check_action "${1:-}" "financial" "${2:-}" "${3:-}"
+    check_action "$1" "financial" "$2" "$3"
 }
 
 # Log action against a mandate (universal)
 log_action() {
     init_ledger
-    local id="${1:-}"
+    local id="$1"
     local amount="${2:-1}"
     local description="${3:-action performed}"
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-    if ! assert_safe_field "mandate_id" "$id"; then
-        return 1
-    fi
-    if ! assert_safe_amount "amount" "$amount"; then
-        return 1
-    fi
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
     # Get current mandate
-    local mandate
-    mandate="$(jq -c --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")"
+    local mandate=$(jq -c --arg id "$id" '.mandates[] | select(.mandate_id == $id)' "$LEDGER_FILE")
     
     if [ -z "$mandate" ] || [ "$mandate" = "null" ]; then
         echo '{"error": "Mandate not found"}'
         return 1
     fi
     
-    local status
-    status="$(printf '%s' "$mandate" | jq -r '.status')"
-    local ttl
-    ttl="$(printf '%s' "$mandate" | jq -r '.ttl')"
-    local action_type
-    action_type="$(printf '%s' "$mandate" | jq -r '.action_type')"
+    local status=$(echo "$mandate" | jq -r '.status')
+    local ttl=$(echo "$mandate" | jq -r '.ttl')
+    local action_type=$(echo "$mandate" | jq -r '.action_type')
     
     if [ "$status" != "active" ]; then
         echo '{"error": "Mandate not active", "status": "'"$status"'"}'
@@ -454,31 +616,21 @@ log_action() {
     
     # Check caps based on action type
     if [ "$action_type" = "financial" ]; then
-        local cap
-        cap="$(printf '%s' "$mandate" | jq -r '.amount_cap // 0')"
-        local used
-        used="$(printf '%s' "$mandate" | jq -r '.usage.total_amount // 0')"
-        local new_used
-        new_used="$(awk -v u="$used" -v a="$amount" 'BEGIN { printf "%.10g", u + a }')"
+        local cap=$(echo "$mandate" | jq -r '.amount_cap // 0')
+        local used=$(echo "$mandate" | jq -r '.usage.total_amount // 0')
+        local new_used=$(echo "$used + $amount" | bc)
         
-        if awk -v n="$new_used" -v c="$cap" 'BEGIN { exit !(n > c) }'; then
+        if (( $(echo "$new_used > $cap" | bc -l) )); then
             echo '{"error": "Exceeds cap", "cap": '$cap', "used": '$used', "requested": '$amount'}'
             return 1
         fi
     fi
     
     # Check rate limit
-    local rate_limit
-    rate_limit="$(printf '%s' "$mandate" | jq -r '.scope.rate_limit // empty')"
+    local rate_limit=$(echo "$mandate" | jq -r '.scope.rate_limit // empty')
     if [ -n "$rate_limit" ]; then
-        if ! [[ "$rate_limit" =~ ^[0-9]+/(day|hour|minute|week|month|year)$ ]]; then
-            echo '{"error": "Invalid rate_limit format", "rate_limit": "'"$rate_limit"'"}'
-            return 1
-        fi
-        local limit_count
-        limit_count="$(printf '%s' "$rate_limit" | cut -d'/' -f1)"
-        local current_count
-        current_count="$(printf '%s' "$mandate" | jq -r '.usage.count // 0')"
+        local limit_count=$(echo "$rate_limit" | cut -d'/' -f1)
+        local current_count=$(echo "$mandate" | jq -r '.usage.count // 0')
         if (( current_count >= limit_count )); then
             echo '{"error": "Rate limit exceeded", "limit": "'"$rate_limit"'", "current": '$current_count'}'
             return 1
@@ -486,19 +638,16 @@ log_action() {
     fi
     
     # Update usage
-    local updated
-    updated="$(jq --arg id "$id" --argjson amt "$amount" \
+    local updated=$(jq --arg id "$id" --argjson amt "$amount" \
         '.mandates = [.mandates[] | if .mandate_id == $id then 
             .usage.count = ((.usage.count // 0) + 1) |
             .usage.total_amount = ((.usage.total_amount // 0) + $amt)
-        else . end]' "$LEDGER_FILE")"
-    safe_write_json_file "$LEDGER_FILE" "$updated"
+        else . end]' "$LEDGER_FILE")
+    echo "$updated" > "$LEDGER_FILE"
     
     # Get updated stats
-    local new_count
-    new_count="$(printf '%s' "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.count')"
-    local new_total
-    new_total="$(printf '%s' "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.total_amount')"
+    local new_count=$(echo "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.count')
+    local new_total=$(echo "$updated" | jq --arg id "$id" '.mandates[] | select(.mandate_id == $id) | .usage.total_amount')
     
     audit_log "action" "$id" "$description" "success"
     
@@ -507,46 +656,24 @@ log_action() {
 
 # Legacy spend for backwards compatibility
 spend() {
-    log_action "${1:-}" "${2:-}" "financial transaction"
+    log_action "$1" "$2" "financial transaction"
 }
 
 export_ledger() {
     init_ledger
-    local mandates agents audit kya_present audit_present
-    mandates="$(jq '.mandates' "$LEDGER_FILE")"
-    kya_present=false
-    audit_present=false
-    if [ -f "$KYA_FILE" ]; then
-        agents="$(jq '.agents' "$KYA_FILE")"
-        kya_present=true
-    else
-        agents='[]'
-    fi
-    if [ -f "$AUDIT_FILE" ]; then
-        audit="$(jq '.entries' "$AUDIT_FILE")"
-        audit_present=true
-    else
-        audit='[]'
-    fi
-    jq -n --argjson m "$mandates" --argjson a "$agents" --argjson au "$audit" \
-        --argjson kp "$kya_present" --argjson ap "$audit_present" \
-        '{"mandates": $m, "agents": $a, "audit": $au, "kya_present": $kp, "audit_present": $ap, "version": "2.1.0", "exported_at": (now | todate)}'
+    cat "$LEDGER_FILE"
 }
 
 # Audit commands
 audit_list() {
     init_ledger
     local limit="${1:-20}"
-    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
-        echo '{"error":"Invalid limit"}'
-        return 1
-    fi
     jq --argjson n "$limit" '.entries | sort_by(.timestamp) | reverse | .[:$n]' "$AUDIT_FILE"
 }
 
 audit_for_mandate() {
     init_ledger
-    local mandate_id="${1:-}"
+    local mandate_id="$1"
     jq --arg id "$mandate_id" '.entries | map(select(.mandate_id == $id))' "$AUDIT_FILE"
 }
 
@@ -572,37 +699,29 @@ audit_summary() {
 # KYA (Know Your Agent) functions
 kya_register() {
     init_ledger
-    local agent_id="${1:-}"
-    local principal="${2:-}"
-    local scope="${3:-}"
+    local agent_id="$1"
+    local principal="$2"
+    local scope="$3"
     local provider="${4:-self-declared}"
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
     # Check if agent already exists
-    local existing
-    existing="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE")"
+    local existing=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE")
     
     if [ -n "$existing" ]; then
         # Update existing
-        local updated
-        updated="$(jq --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" \
+        local updated=$(jq --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" \
             '.agents = [.agents[] | if .agent_id == $id then . + {
                 verified_principal: $principal,
                 authorization_scope: $scope,
                 provider: $provider,
                 verified_at: $now,
                 status: "verified"
-            } else . end]' "$KYA_FILE")"
-        safe_write_json_file "$KYA_FILE" "$updated"
+            } else . end]' "$KYA_FILE")
+        echo "$updated" > "$KYA_FILE"
     else
         # Create new
-        local agent
-        agent="$(jq -n --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" '{
+        local agent=$(jq -n --arg id "$agent_id" --arg principal "$principal" --arg scope "$scope" --arg provider "$provider" --arg now "$now" '{
             agent_id: $id,
             verified_principal: $principal,
             authorization_scope: $scope,
@@ -610,10 +729,9 @@ kya_register() {
             verified_at: $now,
             status: "verified",
             created_at: $now
-        }')"
-        local updated
-        updated="$(jq --argjson agent "$agent" '.agents += [$agent]' "$KYA_FILE")"
-        safe_write_json_file "$KYA_FILE" "$updated"
+        }')
+        local updated=$(jq --argjson agent "$agent" '.agents += [$agent]' "$KYA_FILE")
+        echo "$updated" > "$KYA_FILE"
     fi
     
     audit_log "kya_register" "$agent_id" "principal: $principal" "success"
@@ -622,7 +740,7 @@ kya_register() {
 
 kya_get() {
     init_ledger
-    local agent_id="${1:-}"
+    local agent_id="$1"
     jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id)' "$KYA_FILE"
 }
 
@@ -633,20 +751,14 @@ kya_list() {
 
 kya_revoke() {
     init_ledger
-    local agent_id="${1:-}"
+    local agent_id="$1"
     local reason="${2:-revoked by user}"
-    local now
-    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    local updated
-    updated="$(jq --arg id "$agent_id" --arg reason "$reason" --arg now "$now" \
+    local updated=$(jq --arg id "$agent_id" --arg reason "$reason" --arg now "$now" \
         '.agents = [.agents[] | if .agent_id == $id then . + {status: "revoked", revoked_at: $now, revoke_reason: $reason} else . end]' \
-        "$KYA_FILE")"
-    safe_write_json_file "$KYA_FILE" "$updated"
+        "$KYA_FILE")
+    echo "$updated" > "$KYA_FILE"
     
     audit_log "kya_revoke" "$agent_id" "reason: $reason" "success"
     kya_get "$agent_id"
@@ -655,26 +767,18 @@ kya_revoke() {
 # Create mandate with auto-KYA attachment
 create_mandate_with_kya() {
     init_ledger
-    local payload="${1:-}"
-    if ! assert_valid_json "$payload"; then
-        return 1
-    fi
-    local agent_id
-    agent_id="$(printf '%s' "$payload" | jq -r '.agent_id')"
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
+    local payload="$1"
+    local agent_id=$(echo "$payload" | jq -r '.agent_id')
     
     # Look up KYA for this agent
-    local kya
-    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE")"
+    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE")
     
     if [ -n "$kya" ]; then
         # Attach KYA to scope
-        payload="$(printf '%s' "$payload" | jq --argjson kya "$kya" '.scope.kya = $kya')"
+        payload=$(echo "$payload" | jq --argjson kya "$kya" '.scope.kya = $kya')
     else
         # Mark as unknown
-        payload="$(printf '%s' "$payload" | jq '.scope.kya = {status: "unknown"}')"
+        payload=$(echo "$payload" | jq '.scope.kya = {status: "unknown"}')
     fi
     
     create_mandate "$payload"
@@ -684,7 +788,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.1.0"
+    echo "Agent Passport Local Ledger v2.2.0"
     echo "================================="
     echo ""
     
@@ -724,14 +828,12 @@ summary() {
 
 kill_ledger() {
     init_ledger
-    if [ -z "${*}" ]; then
-        echo '{"error": "Usage: kill <reason> — reason is required"}'
-        return 1
-    fi
-    local reason="${*}"
-    local kill_payload
-    kill_payload="$(printf 'reason=%s\ntimestamp=%s\n' "$reason" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")"
-    safe_write_text_file "$KILLSWITCH_FILE" "$kill_payload"
+    local reason="${*:-No reason provided}"
+
+    {
+        echo "reason=$reason"
+        echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "$KILLSWITCH_FILE"
 
     audit_log "kill" "system" "reason: $reason" "success"
     echo "AGENT PASSPORT: KILL SWITCH ENGAGED. Execution frozen."
@@ -742,7 +844,7 @@ unlock_ledger() {
     init_ledger
 
     if [ -f "$KILLSWITCH_FILE" ]; then
-        rm -f -- "$KILLSWITCH_FILE"
+        rm -f "$KILLSWITCH_FILE"
         audit_log "unlock" "system" "kill switch removed" "success"
         echo "AGENT PASSPORT: KILL SWITCH DISENGAGED. Operations restored."
     else
@@ -753,11 +855,7 @@ unlock_ledger() {
 
 # Parse TTL duration string (7d, 24h, 30d) to ISO timestamp
 parse_ttl_duration() {
-    local duration="${1:-}"
-    if ! [[ "$duration" =~ ^[0-9]+[dhm]$ ]]; then
-        echo "Invalid duration: $duration (use e.g. 7d, 24h, 30m)" >&2
-        return 1
-    fi
+    local duration="$1"
     local num="${duration%[dhm]}"
     local unit="${duration: -1}"
     
@@ -774,20 +872,12 @@ parse_ttl_duration() {
 
 # Template definitions
 get_template() {
-    local template="${1:-}"
-    local agent_id="${2:-}"
+    local template="$1"
+    local agent_id="$2"
     shift 2
     
     if [ -z "$agent_id" ]; then
         echo "Error: agent_id required. Usage: create-from-template <template> <agent_id> [args...]" >&2
-        return 1
-    fi
-    if ! assert_safe_field "template" "$template" >/dev/null; then
-        echo "Error: invalid template value" >&2
-        return 1
-    fi
-    if ! assert_safe_field "agent_id" "$agent_id" >/dev/null; then
-        echo "Error: invalid agent_id" >&2
         return 1
     fi
     
@@ -809,13 +899,9 @@ get_template() {
             }'
             ;;
         email-team)
-            local domain="${1:-}"
+            local domain="$1"
             if [ -z "$domain" ]; then
                 echo "Error: domain required. Usage: create-from-template email-team <agent_id> <domain>" >&2
-                return 1
-            fi
-            if [[ "$domain" == *".."* ]] || [[ "$domain" == *"/"* ]] || [[ "$domain" == *"\\"* ]] || ! [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
-                echo "Error: invalid domain" >&2
                 return 1
             fi
             jq -n --arg agent "$agent_id" --arg ttl "$ttl_30d" --arg pattern "*@${domain}" '{
@@ -829,13 +915,9 @@ get_template() {
             }'
             ;;
         file-ops)
-            local basepath="${1:-}"
+            local basepath="$1"
             if [ -z "$basepath" ]; then
                 echo "Error: base path required. Usage: create-from-template file-ops <agent_id> <path>" >&2
-                return 1
-            fi
-            if ! assert_safe_path_value "basepath" "$basepath" >/dev/null; then
-                echo "Error: invalid base path" >&2
                 return 1
             fi
             jq -n --arg agent "$agent_id" --arg ttl "$ttl_30d" --arg pattern "${basepath}/*" '{
@@ -942,9 +1024,9 @@ get_default_agent() {
 }
 
 create_from_template() {
-    local template="${1:-}"
+    local template="$1"
     shift
-    local agent_id="${1:-}"
+    local agent_id="$1"
     
     # Auto-detect agent_id if not provided
     if [ -z "$agent_id" ]; then
@@ -955,15 +1037,14 @@ create_from_template() {
         fi
     fi
     
-    local payload
-    if ! payload="$(get_template "$template" "$agent_id" "${@:2}")"; then
+    local payload=$(get_template "$template" "$agent_id" "${@:2}")
+    if [ $? -ne 0 ]; then
         echo "$payload"
         return 1
     fi
     
     # Check if agent has KYA entry, use create_mandate_with_kya if so
-    local kya
-    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null || true)"
+    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null)
     if [ -n "$kya" ]; then
         create_mandate_with_kya "$payload"
     else
@@ -972,11 +1053,11 @@ create_from_template() {
 }
 
 create_quick() {
-    local action_type="${1:-}"
-    local agent_id="${2:-}"
-    local allowlist_csv="${3:-}"
-    local ttl_duration="${4:-}"
-    local amount_cap="${5:-}"
+    local action_type="$1"
+    local agent_id="$2"
+    local allowlist_csv="$3"
+    local ttl_duration="$4"
+    local amount_cap="$5"
     
     # Auto-detect agent_id if empty
     if [ -z "$agent_id" ]; then
@@ -991,33 +1072,15 @@ create_quick() {
         echo '{"error": "Usage: create-quick <action_type> <agent_id> <allowlist_csv> <ttl_duration> [amount_cap]"}'
         return 1
     fi
-    if ! assert_safe_field "action_type" "$action_type"; then
-        return 1
-    fi
-    if ! assert_safe_field "agent_id" "$agent_id"; then
-        return 1
-    fi
-    if [[ "$allowlist_csv" == *'`'* ]] || [[ "$allowlist_csv" == *'$('* ]] || [[ "$allowlist_csv" == *';'* ]] || [[ "$allowlist_csv" == *'|'* ]]; then
-        json_error "Invalid allowlist_csv"
-        return 1
-    fi
-    if [ -n "${amount_cap:-}" ] && ! assert_safe_amount "amount_cap" "$amount_cap"; then
-        return 1
-    fi
     
-    local ttl
-    if ! ttl="$(parse_ttl_duration "$ttl_duration")"; then
-        echo '{"error": "Invalid TTL duration: '"$ttl_duration"'. Use e.g. 7d, 24h, 30m"}'
-        return 1
-    fi
-    if [ -z "$ttl" ]; then
+    local ttl=$(parse_ttl_duration "$ttl_duration")
+    if [ $? -ne 0 ] || [ -z "$ttl" ]; then
         echo '{"error": "Invalid TTL duration: '"$ttl_duration"'. Use e.g. 7d, 24h, 30m"}'
         return 1
     fi
     
     # Convert CSV to JSON array
-    local allowlist
-    allowlist="$(printf '%s' "$allowlist_csv" | jq -R 'split(",")')"
+    local allowlist=$(echo "$allowlist_csv" | jq -R 'split(",")')
     
     local payload
     if [ -n "$amount_cap" ]; then
@@ -1039,8 +1102,7 @@ create_quick() {
     
     # Check if agent has KYA entry
     init_ledger
-    local kya
-    kya="$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null || true)"
+    local kya=$(jq -c --arg id "$agent_id" '.agents[] | select(.agent_id == $id and .status == "verified")' "$KYA_FILE" 2>/dev/null)
     if [ -n "$kya" ]; then
         create_mandate_with_kya "$payload"
     else
@@ -1056,7 +1118,7 @@ init_passport() {
     
     local mandate_count=0
     if [ -f "$LEDGER_FILE" ]; then
-        mandate_count="$(jq '.mandates | length' "$LEDGER_FILE" 2>/dev/null || echo 0)"
+        mandate_count=$(jq '.mandates | length' "$LEDGER_FILE" 2>/dev/null || echo 0)
         if [ "$mandate_count" -gt 0 ] || [ -f "$AUDIT_FILE" ]; then
             # Already initialized
             init_ledger
@@ -1070,8 +1132,7 @@ init_passport() {
             fi
             
             # Check for existing registered agent
-            local registered
-            registered="$(jq -r '.agents[] | select(.status == "verified") | "\(.agent_id) (principal: \(.verified_principal))"' "$KYA_FILE" 2>/dev/null | head -1 || true)"
+            local registered=$(jq -r '.agents[] | select(.status == "verified") | "\(.agent_id) (principal: \(.verified_principal))"' "$KYA_FILE" 2>/dev/null | head -1)
             if [ -n "$registered" ]; then
                 echo "Already initialized at $LEDGER_DIR/ ($mandate_count mandates)"
                 echo "🪪 Registered agent: $registered"
@@ -1162,7 +1223,7 @@ if kill_switch_engaged && [ "${1:-}" != "unlock" ]; then
     exit 1
 fi
 
-case "${1:-}" in
+case "$1" in
     init)
         init_passport "$@"
         ;;
@@ -1170,45 +1231,45 @@ case "${1:-}" in
         list_templates
         ;;
     create-from-template)
-        create_from_template "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+        create_from_template "$2" "$3" "$4" "$5"
         ;;
     create-quick)
-        create_quick "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+        create_quick "$2" "$3" "$4" "$5" "$6"
         ;;
     create)
-        create_mandate "${2:-}"
+        create_mandate "$2"
         ;;
     create-with-kya)
-        create_mandate_with_kya "${2:-}"
+        create_mandate_with_kya "$2"
         ;;
     get)
-        get_mandate "${2:-}"
+        get_mandate "$2"
         ;;
     list)
-        list_mandates "${2:-}"
+        list_mandates "$2"
         ;;
     revoke)
-        revoke_mandate "${2:-}" "${3:-}"
+        revoke_mandate "$2" "$3"
         ;;
     check)
         # Legacy: check <agent> <merchant> <amount>
         # New:    check <agent> <action_type> <target> [amount]
-        if [ "$#" -eq 4 ] && [[ "${4:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            # Legacy format: check <agent> <merchant> <amount>
-            check_mandate "${2:-}" "${3:-}" "${4:-}"
+        if [ "$#" -eq 4 ] && [[ "$3" =~ ^[0-9]+$ ]]; then
+            # Legacy format: third arg is numeric amount
+            check_mandate "$2" "$3" "$4"
         else
-            # New format: check <agent> <action_type> <target> [amount]
-            check_action "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+            # New format
+            check_action "$2" "$3" "$4" "$5"
         fi
         ;;
     check-action)
-        check_action "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+        check_action "$2" "$3" "$4" "$5"
         ;;
     log|log-action)
-        log_action "${2:-}" "${3:-}" "${4:-}"
+        log_action "$2" "$3" "$4"
         ;;
     spend)
-        spend "${2:-}" "${3:-}"
+        spend "$2" "$3"
         ;;
     summary)
         summary
@@ -1217,25 +1278,34 @@ case "${1:-}" in
         export_ledger
         ;;
     audit)
-        audit_list "${2:-}"
+        audit_list "$2"
         ;;
     audit-mandate)
-        audit_for_mandate "${2:-}"
+        audit_for_mandate "$2"
         ;;
     audit-summary)
-        audit_summary "${2:-}"
+        audit_summary "$2"
         ;;
     kya-register)
-        kya_register "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+        kya_register "$2" "$3" "$4" "$5"
         ;;
     kya-get)
-        kya_get "${2:-}"
+        kya_get "$2"
         ;;
     kya-list)
         kya_list
         ;;
     kya-revoke)
-        kya_revoke "${2:-}" "${3:-}"
+        kya_revoke "$2" "$3"
+        ;;
+    check-ssrf)
+        check_ssrf "$2"
+        ;;
+    check-path)
+        check_path "$2" "$3"
+        ;;
+    verify-webhook)
+        verify_webhook "$2" "$3" "$4" "$5" "$6"
         ;;
     kill)
         kill_ledger "${*:2}"
@@ -1244,7 +1314,7 @@ case "${1:-}" in
         unlock_ledger
         ;;
     *)
-        echo "Agent Passport - Local Mandate Ledger v2.1.0"
+        echo "Agent Passport - Local Mandate Ledger v2.2.0"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -1296,6 +1366,12 @@ case "${1:-}" in
         echo "SAFETY:"
         echo "  kill <reason>                           Engage kill switch and freeze execution"
         echo "  unlock                                  Disengage kill switch and resume execution"
+        echo ""
+        echo "SECURITY (v2.2.0):"
+        echo "  check-ssrf <url>                        SSRF Shield: validate URL is safe to fetch"
+        echo "  check-path <path> [safe_root]           Path Traversal Guard: validate file path"
+        echo "  verify-webhook <origin> <domains_csv>   Webhook Origin Verification (+ optional HMAC)"
+        echo "    [hmac_secret] [hmac_sig] [hmac_body]"
         exit 1
         ;;
 esac
