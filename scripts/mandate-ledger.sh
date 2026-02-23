@@ -1,7 +1,7 @@
 #!/bin/bash
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
-# v2.3.0: SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, Injection Shield
+# v2.3.1: SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, Injection Shield
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
@@ -20,7 +20,7 @@ KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 init_ledger() {
     mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.3.0"}' > "$LEDGER_FILE"
+        echo '{"mandates":[],"version":"2.3.1"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
         echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
@@ -337,7 +337,7 @@ verify_webhook() {
         '{webhook_valid: $webhook_valid, origin_valid: $origin_valid, signature_valid: $signature_valid, reason: $reason}'
 }
 
-# ─── Skill Scanner (v2.3.0) ──────────────────────────────────────────────────
+# ─── Skill Scanner (v2.3.1) ──────────────────────────────────────────────────
 # Static analysis scanner for skill files/directories.
 scan_skill() {
     local scan_path="$1"
@@ -512,7 +512,7 @@ scan_skill() {
 
     if [ "$output_json" = "true" ]; then
         jq -n \
-            --arg scanner_version "2.3.0" \
+            --arg scanner_version "2.3.1" \
             --arg path "$scan_path" \
             --argjson files_scanned "$files_scanned" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -539,7 +539,7 @@ scan_skill() {
         return $exit_code
     fi
 
-    echo "Agent Passport - Skill Scanner v2.3.0"
+    echo "Agent Passport - Skill Scanner v2.3.1"
     echo "Scanning: $scan_path"
     echo ""
 
@@ -588,7 +588,7 @@ scan_skill() {
     return $exit_code
 }
 
-# ─── Injection Shield (v2.3.0) ───────────────────────────────────────────────
+# ─── Injection Shield (v2.3.1) ───────────────────────────────────────────────
 # Scans inbound content for prompt injection attempts before processing.
 check_injection() {
     local content="$1"
@@ -731,7 +731,7 @@ check_injection() {
 
     if [ "$output_json" = "true" ]; then
         jq -n \
-            --arg scanner_version "2.3.0" \
+            --arg scanner_version "2.3.1" \
             --arg source "$source_label" \
             --argjson content_length "$content_length" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -756,7 +756,7 @@ check_injection() {
         return $exit_code
     fi
 
-    echo "Agent Passport - Injection Shield v2.3.0"
+    echo "Agent Passport - Injection Shield v2.3.1"
     echo "Source: $source_label"
     echo ""
 
@@ -1342,7 +1342,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.3.0"
+    echo "Agent Passport Local Ledger v2.3.1"
     echo "================================="
     echo ""
     
@@ -1874,7 +1874,7 @@ case "$1" in
         unlock_ledger
         ;;
     *)
-        echo "Agent Passport - Local Mandate Ledger v2.3.0"
+        echo "Agent Passport - Local Mandate Ledger v2.3.1"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -1927,7 +1927,7 @@ case "$1" in
         echo "  kill <reason>                           Engage kill switch and freeze execution"
         echo "  unlock                                  Disengage kill switch and resume execution"
         echo ""
-        echo "SECURITY (v2.3.0):"
+        echo "SECURITY (v2.3.1):"
         echo "  check-ssrf <url>                        SSRF Shield: validate URL is safe to fetch"
         echo "  check-path <path> [safe_root]           Path Traversal Guard: validate file path"
         echo "  verify-webhook <origin> <domains_csv>   Webhook Origin Verification (+ optional HMAC)"

