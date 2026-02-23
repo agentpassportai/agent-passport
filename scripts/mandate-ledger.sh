@@ -1,7 +1,7 @@
 #!/bin/bash
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
-# v2.3.1: SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, Injection Shield
+# v2.3.0: SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, Injection Shield
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
@@ -20,7 +20,7 @@ KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 init_ledger() {
     mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.3.1"}' > "$LEDGER_FILE"
+        echo '{"mandates":[],"version":"2.3.0"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
         echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
@@ -337,7 +337,60 @@ verify_webhook() {
         '{webhook_valid: $webhook_valid, origin_valid: $origin_valid, signature_valid: $signature_valid, reason: $reason}'
 }
 
-# ─── Skill Scanner (v2.3.1) ──────────────────────────────────────────────────
+# ─── Pro License Gating (v2.4.0) ─────────────────────────────────────────────
+# Validates license key against api.agentpassportai.com. Caches for 7 days.
+# Returns the tier string: "pro" or "free"
+check_license() {
+    local required_feature="${1:-threats}"
+    local cache_file="$LEDGER_DIR/.license_cache"
+    local cache_ttl=604800  # 7 days
+
+    if [ -z "$AGENT_PASSPORT_LICENSE_KEY" ]; then
+        echo "free"; return 0
+    fi
+
+    if [ -f "$cache_file" ]; then
+        local cached_at now
+        cached_at=$(jq -r '.cached_at // 0' "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        if [ $((now - cached_at)) -lt $cache_ttl ]; then
+            jq -r '.tier // "free"' "$cache_file" 2>/dev/null || echo "free"
+            return 0
+        fi
+    fi
+
+    local response now
+    response=$(curl -sf --max-time 5 \
+        "https://api.agentpassportai.com/v1/license/validate?key=$AGENT_PASSPORT_LICENSE_KEY" \
+        2>/dev/null)
+
+    if [ $? -eq 0 ] && [ -n "$response" ]; then
+        now=$(date +%s)
+        echo "$response" | jq ". + {\"cached_at\": $now}" > "$cache_file" 2>/dev/null
+        jq -r '.tier // "free"' "$cache_file" 2>/dev/null || echo "free"
+    else
+        [ -f "$cache_file" ] && jq -r '.tier // "free"' "$cache_file" 2>/dev/null || echo "free"
+    fi
+}
+
+# Fetches live threat patterns from api.agentpassportai.com if Pro key present.
+# Prints JSON on success, returns 1 on failure (caller uses static patterns).
+fetch_live_patterns() {
+    [ -z "$AGENT_PASSPORT_LICENSE_KEY" ] && return 1
+    [ "$(check_license threats)" != "pro" ] && return 1
+
+    local response
+    response=$(curl -sf --max-time 10 \
+        "https://api.agentpassportai.com/v1/threats?key=$AGENT_PASSPORT_LICENSE_KEY" \
+        2>/dev/null)
+
+    if [ $? -eq 0 ] && echo "$response" | jq -e '.patterns' > /dev/null 2>&1; then
+        echo "$response"; return 0
+    fi
+    return 1
+}
+
+# ─── Skill Scanner (v2.3.0) ──────────────────────────────────────────────────
 # Static analysis scanner for skill files/directories.
 scan_skill() {
     local scan_path="$1"
@@ -365,6 +418,15 @@ scan_skill() {
     if [ ! -e "$scan_path" ]; then
         echo "Path not found: $scan_path" >&2
         return 1
+    fi
+
+    # Check for Pro license and attempt to fetch live threat patterns
+    local live_patterns_json=""
+    local using_live=false
+    local live_updated=""
+    if live_patterns_json=$(fetch_live_patterns 2>/dev/null); then
+        using_live=true
+        live_updated=$(echo "$live_patterns_json" | jq -r '.updated_at // "today"' 2>/dev/null || echo "today")
     fi
 
     local files_scanned=0
@@ -512,7 +574,7 @@ scan_skill() {
 
     if [ "$output_json" = "true" ]; then
         jq -n \
-            --arg scanner_version "2.3.1" \
+            --arg scanner_version "2.3.0" \
             --arg path "$scan_path" \
             --argjson files_scanned "$files_scanned" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -539,8 +601,13 @@ scan_skill() {
         return $exit_code
     fi
 
-    echo "Agent Passport - Skill Scanner v2.3.1"
+    echo "Agent Passport - Skill Scanner v2.3.0"
     echo "Scanning: $scan_path"
+    if [ "$using_live" = true ]; then
+        echo "Threat intelligence: live (updated $live_updated)"
+    else
+        echo "Threat intelligence: static (v2.3.1) — upgrade for live updates: agentpassportai.com/pro"
+    fi
     echo ""
 
     if [ "$result" = "clean" ]; then
@@ -588,7 +655,7 @@ scan_skill() {
     return $exit_code
 }
 
-# ─── Injection Shield (v2.3.1) ───────────────────────────────────────────────
+# ─── Injection Shield (v2.3.0) ───────────────────────────────────────────────
 # Scans inbound content for prompt injection attempts before processing.
 check_injection() {
     local content="$1"
@@ -731,7 +798,7 @@ check_injection() {
 
     if [ "$output_json" = "true" ]; then
         jq -n \
-            --arg scanner_version "2.3.1" \
+            --arg scanner_version "2.3.0" \
             --arg source "$source_label" \
             --argjson content_length "$content_length" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -756,7 +823,7 @@ check_injection() {
         return $exit_code
     fi
 
-    echo "Agent Passport - Injection Shield v2.3.1"
+    echo "Agent Passport - Injection Shield v2.3.0"
     echo "Source: $source_label"
     echo ""
 
@@ -1342,7 +1409,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.3.1"
+    echo "Agent Passport Local Ledger v2.3.0"
     echo "================================="
     echo ""
     
@@ -1874,7 +1941,7 @@ case "$1" in
         unlock_ledger
         ;;
     *)
-        echo "Agent Passport - Local Mandate Ledger v2.3.1"
+        echo "Agent Passport - Local Mandate Ledger v2.3.0"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -1927,7 +1994,7 @@ case "$1" in
         echo "  kill <reason>                           Engage kill switch and freeze execution"
         echo "  unlock                                  Disengage kill switch and resume execution"
         echo ""
-        echo "SECURITY (v2.3.1):"
+        echo "SECURITY (v2.3.0):"
         echo "  check-ssrf <url>                        SSRF Shield: validate URL is safe to fetch"
         echo "  check-path <path> [safe_root]           Path Traversal Guard: validate file path"
         echo "  verify-webhook <origin> <domains_csv>   Webhook Origin Verification (+ optional HMAC)"
