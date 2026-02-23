@@ -284,3 +284,9 @@ Users want autonomous agents but fear giving them power. Agent Passport provides
 ---
 
 Built for [OpenClaw](https://openclaw.ai) | Upgrade to [Agent Bridge](https://agentbridge.dev)
+
+---
+
+**License:** MIT with Commons Clause. Free to use and modify. Commercial use of the software or the "Agent Passport" name requires a license. See [LICENSE](LICENSE) and [TRADEMARK.md](TRADEMARK.md).
+
+Commercial licensing: legal@agentpassportai.com
