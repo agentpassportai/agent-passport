@@ -1,7 +1,7 @@
 #!/bin/bash
 # Agent Passport - Local Mandate Ledger (Expanded)
 # Consent-gating for ALL sensitive actions, not just purchases
-# v2.2.1: SSRF Shield, Path Traversal Guard, Webhook Origin Verification
+# v2.3.0: SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, Injection Shield
 
 LEDGER_DIR="${AGENT_PASSPORT_LEDGER_DIR:-$HOME/.openclaw/agent-passport}"
 LEDGER_FILE="$LEDGER_DIR/mandates.json"
@@ -20,7 +20,7 @@ KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
 init_ledger() {
     mkdir -p "$LEDGER_DIR"
     if [ ! -f "$LEDGER_FILE" ]; then
-        echo '{"mandates":[],"version":"2.2.1"}' > "$LEDGER_FILE"
+        echo '{"mandates":[],"version":"2.3.0"}' > "$LEDGER_FILE"
     fi
     if [ ! -f "$KYA_FILE" ]; then
         echo '{"agents":[],"version":"1.0"}' > "$KYA_FILE"
@@ -335,6 +335,477 @@ verify_webhook() {
         --argjson signature_valid "$signature_valid" \
         --arg reason "$reason" \
         '{webhook_valid: $webhook_valid, origin_valid: $origin_valid, signature_valid: $signature_valid, reason: $reason}'
+}
+
+# ─── Skill Scanner (v2.3.0) ──────────────────────────────────────────────────
+# Static analysis scanner for skill files/directories.
+scan_skill() {
+    local scan_path="$1"
+    shift
+
+    local output_json=false
+    local strict=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) output_json=true ;;
+            --strict) strict=true ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$scan_path" ]; then
+        echo "Usage: mandate-ledger.sh scan-skill <path> [--json] [--strict]" >&2
+        return 1
+    fi
+
+    if [ ! -e "$scan_path" ]; then
+        echo "Path not found: $scan_path" >&2
+        return 1
+    fi
+
+    local files_scanned=0
+    local critical_count=0
+    local high_count=0
+    local medium_count=0
+    local low_count=0
+    local findings_json='[]'
+    local scan_timestamp
+    scan_timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    add_scan_finding() {
+        local severity="$1"
+        local type="$2"
+        local description="$3"
+        local file="$4"
+        local line="$5"
+        local match="$6"
+        local risk="$7"
+
+        case "$severity" in
+            critical) critical_count=$((critical_count + 1)) ;;
+            high) high_count=$((high_count + 1)) ;;
+            medium) medium_count=$((medium_count + 1)) ;;
+            low) low_count=$((low_count + 1)) ;;
+        esac
+
+        findings_json=$(echo "$findings_json" | jq \
+            --arg severity "$severity" \
+            --arg type "$type" \
+            --arg description "$description" \
+            --arg file "$file" \
+            --argjson line "$line" \
+            --arg match "$match" \
+            --arg risk "$risk" \
+            '. + [{
+                severity: $severity,
+                type: $type,
+                description: $description,
+                file: $file,
+                line: $line,
+                match: $match,
+                risk: $risk
+            }]')
+    }
+
+    scan_pattern() {
+        local file="$1"
+        local severity="$2"
+        local type="$3"
+        local description="$4"
+        local regex="$5"
+        local risk="$6"
+        local grep_mode="${7:-E}"
+
+        local grep_cmd="-inE"
+        if [ "$grep_mode" = "P" ]; then
+            grep_cmd="-inP"
+        fi
+
+        while IFS= read -r row; do
+            local ln="${row%%:*}"
+            local txt="${row#*:}"
+            add_scan_finding "$severity" "$type" "$description" "$file" "${ln:-0}" "$txt" "$risk"
+        done < <(grep $grep_cmd "$regex" "$file" 2>/dev/null || true)
+    }
+
+    process_scan_file() {
+        local file="$1"
+        local base
+        base=$(basename "$file")
+        local lower_file
+        lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+
+        if ! grep -Iq . "$file" 2>/dev/null; then
+            return 0
+        fi
+
+        files_scanned=$((files_scanned + 1))
+
+        # CRITICAL
+        scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'curl[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
+        scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'wget[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
+        scan_pattern "$file" "critical" "obfuscated_exec" "Base64 decode piped to shell" 'base64[^|]*\|[[:space:]]*(bash|sh)' "Obfuscated payload decoded and executed in shell"
+        scan_pattern "$file" "critical" "obfuscated_exec" "Eval of base64-decoded content" 'eval.*base64' "Runtime execution of obfuscated payload"
+        scan_pattern "$file" "critical" "dangerous_eval" "Eval of command substitution" 'eval.*\$\(' "Evaluates command substitution output directly" "P"
+        scan_pattern "$file" "critical" "daemon_install" "Suspicious remote daemon install pattern" '(openclaw-core|clawd-core).*(install|daemon|service)' "Likely persistence/backdoor style system daemon install"
+
+        # HIGH
+        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded AWS key detected" 'AKIA[0-9A-Z]{16}' "Credential embedded in skill file may be harvested or misused"
+        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded GitHub token detected" 'ghp_[A-Za-z0-9]{36}' "Credential embedded in skill file may be harvested or misused"
+        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded OpenAI key detected" 'sk-[A-Za-z0-9]{48}' "Credential embedded in skill file may be harvested or misused"
+        scan_pattern "$file" "high" "hardcoded_secret" "Possible high-entropy secret assignment" '[A-Za-z_][A-Za-z0-9_]{2,}[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/_=-]{32,}["'"'"']?' "Potential secret/token hardcoded in assignment"
+        if [ "$base" = "SKILL.md" ]; then
+            scan_pattern "$file" "high" "global_install" "Global npm install in SKILL.md" 'npm[[:space:]]+install[[:space:]]+-g' "Installs system-wide package without explicit user consent"
+            scan_pattern "$file" "high" "package_install" "pip install in SKILL.md" 'pip([0-9]+)?[[:space:]]+install' "Installs Python package without explicit user consent"
+        fi
+        scan_pattern "$file" "high" "chmod_download" "Downloaded file made executable" '((curl|wget).*(chmod[[:space:]]+\+x))|((chmod[[:space:]]+\+x).*(curl|wget))' "Downloaded payload is made executable, increasing malware risk"
+        scan_pattern "$file" "high" "cron_modify" "Cron table modification" 'crontab[[:space:]]+-' "Modifies scheduled tasks for persistence"
+        scan_pattern "$file" "high" "shell_persist" "Shell profile modification" '(\~|/home/[^/]+)/\.(bashrc|zshrc)' "Persistent shell profile modification may hide malicious startup commands"
+        scan_pattern "$file" "high" "ssh_modify" "SSH directory modification" '(\~|/home/[^/]+)/\.ssh/' "SSH key/config modification may enable unauthorized access"
+        scan_pattern "$file" "high" "system_modify" "System config path write" '/etc/' "System configuration modification outside normal skill scope"
+
+        # MEDIUM
+        scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore previous instructions' "Attempts to override agent behavior"
+        scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore all previous' "Attempts to override agent behavior"
+        scan_pattern "$file" "medium" "prompt_injection" "Instruction override marker" 'new instructions[[:space:]]*:' "Attempts to inject alternate instructions"
+        if [[ "$lower_file" == *.md ]]; then
+            scan_pattern "$file" "medium" "prompt_override" "System prompt override marker" '^[[:space:]]*system:' "Attempts to masquerade as a system-level instruction"
+        fi
+        scan_pattern "$file" "medium" "persona_hijack" "Persona hijacking pattern" 'you are now' "Attempts to rewrite the assistant persona"
+        scan_pattern "$file" "medium" "role_injection" "Role injection pattern" 'act as' "Attempts to alter role/behavior outside trusted prompt"
+        scan_pattern "$file" "medium" "ap_bypass" "Agent Passport env var manipulation" 'AGENT_PASSPORT' "May attempt to disable or bypass Agent Passport controls"
+        scan_pattern "$file" "medium" "dangerous_delete" "Broad deletion command" 'rm[[:space:]]+-rf([[:space:]]|$)(/|~|\$HOME|\*)?' "Potentially destructive broad deletion command"
+        scan_pattern "$file" "medium" "privilege_escalation" "sudo usage" '(^|[[:space:]])sudo([[:space:]]|$)' "Privilege escalation request detected"
+
+        # LOW
+        scan_pattern "$file" "low" "local_target" "Hardcoded IP or localhost reference" '((^|[^0-9])(127\.0\.0\.1|0\.0\.0\.0|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}|localhost)([^0-9]|$))' "May reference internal/local network services"
+        scan_pattern "$file" "low" "env_harvest" "Environment variable harvesting pattern" '(process\.env|\$HOME)' "References sensitive runtime environment data"
+    }
+
+    if [ -d "$scan_path" ]; then
+        while IFS= read -r file; do
+            process_scan_file "$file"
+        done < <(find "$scan_path" -type f 2>/dev/null)
+    else
+        process_scan_file "$scan_path"
+    fi
+
+    local result="clean"
+    if [ $((critical_count + high_count + medium_count + low_count)) -gt 0 ]; then
+        result="unsafe"
+    fi
+
+    local exit_code=0
+    if [ "$strict" = "true" ]; then
+        [ $((critical_count + high_count + medium_count + low_count)) -gt 0 ] && exit_code=1
+    else
+        [ $((critical_count + high_count)) -gt 0 ] && exit_code=1
+    fi
+
+    audit_log "security_scan" "system" \
+        "path: $scan_path, files: $files_scanned, critical: $critical_count, high: $high_count, medium: $medium_count, low: $low_count" \
+        "$result"
+
+    if [ "$output_json" = "true" ]; then
+        jq -n \
+            --arg scanner_version "2.3.0" \
+            --arg path "$scan_path" \
+            --argjson files_scanned "$files_scanned" \
+            --arg scan_timestamp "$scan_timestamp" \
+            --arg result "$result" \
+            --argjson critical "$critical_count" \
+            --argjson high "$high_count" \
+            --argjson medium "$medium_count" \
+            --argjson low "$low_count" \
+            --argjson findings "$findings_json" \
+            '{
+                scanner_version: $scanner_version,
+                path: $path,
+                files_scanned: $files_scanned,
+                scan_timestamp: $scan_timestamp,
+                result: $result,
+                summary: {
+                    critical: $critical,
+                    high: $high,
+                    medium: $medium,
+                    low: $low
+                },
+                findings: $findings
+            }'
+        return $exit_code
+    fi
+
+    echo "Agent Passport - Skill Scanner v2.3.0"
+    echo "Scanning: $scan_path"
+    echo ""
+
+    if [ "$result" = "clean" ]; then
+        echo "✓ No issues found across $files_scanned files"
+        echo ""
+        echo "──────────────────────────────────────"
+        echo "RESULT: ✅ CLEAN - skill appears safe to install"
+        echo "──────────────────────────────────────"
+        return 0
+    fi
+
+    print_scan_bucket() {
+        local severity="$1"
+        local label="$2"
+        local icon="$3"
+        local count="$4"
+        echo "${label} (${count})"
+        if [ "$count" -eq 0 ]; then
+            echo "  ✓ No ${severity}-severity issues"
+            echo ""
+            return 0
+        fi
+
+        local rows
+        rows=$(echo "$findings_json" | jq -c --arg sev "$severity" '.[] | select(.severity == $sev)')
+        while IFS= read -r row; do
+            [ -z "$row" ] && continue
+            echo "  $icon [${label}] $(echo "$row" | jq -r '.description')"
+            echo "    File: $(echo "$row" | jq -r '.file'), Line $(echo "$row" | jq -r '.line')"
+            echo "    Match: $(echo "$row" | jq -r '.match')"
+            echo "    Risk: $(echo "$row" | jq -r '.risk')"
+            echo ""
+        done <<< "$rows"
+    }
+
+    print_scan_bucket "critical" "CRITICAL" "✗" "$critical_count"
+    print_scan_bucket "high" "HIGH" "✗" "$high_count"
+    print_scan_bucket "medium" "MEDIUM" "⚠" "$medium_count"
+    print_scan_bucket "low" "LOW" "⚠" "$low_count"
+
+    echo "──────────────────────────────────────"
+    echo "RESULT: ❌ UNSAFE - $critical_count critical, $high_count high, $medium_count medium, $low_count low finding(s)"
+    echo "         Do NOT install this skill."
+    echo "──────────────────────────────────────"
+    return $exit_code
+}
+
+# ─── Injection Shield (v2.3.0) ───────────────────────────────────────────────
+# Scans inbound content for prompt injection attempts before processing.
+check_injection() {
+    local content="$1"
+    shift
+
+    local source_label="unknown"
+    local output_json=false
+    local strict=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source)
+                source_label="$2"
+                shift
+                ;;
+            --json) output_json=true ;;
+            --strict) strict=true ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$content" ]; then
+        echo "Usage: mandate-ledger.sh check-injection \"<content>\" [--source <label>] [--json] [--strict]" >&2
+        return 1
+    fi
+
+    if [ "$content" = "-" ]; then
+        content=$(cat)
+    fi
+
+    local scan_timestamp
+    scan_timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local content_length
+    content_length=$(printf '%s' "$content" | wc -c | tr -d ' ')
+    local critical_count=0
+    local high_count=0
+    local medium_count=0
+    local findings_json='[]'
+
+    add_injection_finding() {
+        local severity="$1"
+        local type="$2"
+        local description="$3"
+        local line="$4"
+        local match="$5"
+        local risk="$6"
+
+        case "$severity" in
+            critical) critical_count=$((critical_count + 1)) ;;
+            high) high_count=$((high_count + 1)) ;;
+            medium) medium_count=$((medium_count + 1)) ;;
+        esac
+
+        findings_json=$(echo "$findings_json" | jq \
+            --arg severity "$severity" \
+            --arg type "$type" \
+            --arg description "$description" \
+            --argjson line "$line" \
+            --arg match "$match" \
+            --arg risk "$risk" \
+            '. + [{
+                severity: $severity,
+                type: $type,
+                description: $description,
+                line: $line,
+                match: $match,
+                risk: $risk
+            }]')
+    }
+
+    scan_injection_pattern() {
+        local severity="$1"
+        local type="$2"
+        local description="$3"
+        local regex="$4"
+        local risk="$5"
+        local grep_mode="${6:-E}"
+
+        local grep_cmd="-inE"
+        if [ "$grep_mode" = "P" ]; then
+            grep_cmd="-inP"
+        fi
+
+        while IFS= read -r row; do
+            local ln="${row%%:*}"
+            local txt="${row#*:}"
+            add_injection_finding "$severity" "$type" "$description" "${ln:-0}" "$txt" "$risk"
+        done < <(printf '%s\n' "$content" | grep $grep_cmd "$regex" 2>/dev/null || true)
+    }
+
+    # CRITICAL
+    scan_injection_pattern "critical" "instruction_override" "Direct instruction override attempt" 'ignore[[:space:]]+(all[[:space:]]+)?(previous|prior)[[:space:]]+instructions' "Attempts to override agent behavior and trusted instruction hierarchy"
+    scan_injection_pattern "critical" "system_override" "System instruction override attempt" 'ignore[[:space:]]+(your[[:space:]]+)?(system[[:space:]]+)?(prompt|instructions|guidelines|rules)' "Attempts to disable or replace the system/developer safety policy"
+    scan_injection_pattern "critical" "task_injection" "New task/directive injection marker" 'new[[:space:]]+(task|instructions?|directive)[[:space:]]*:' "Attempts to inject alternate tasks into untrusted content"
+    scan_injection_pattern "critical" "fake_system" "Fake system-message token" '(\[system\]|<system>)' "Pretends untrusted content has system-level authority"
+    scan_injection_pattern "critical" "persona_override" "Persona override attempt" 'you are now' "Attempts to rewrite assistant identity/behavior"
+    scan_injection_pattern "critical" "identity_confusion" "Instruction identity confusion attack" 'your[[:space:]]+(real|true|actual)[[:space:]]+instructions' "Attempts to confuse model about trusted instruction source"
+    scan_injection_pattern "critical" "role_output_injection" "Model output impersonation marker" '^[[:space:]]*(assistant|ai|claude)[[:space:]]*:' "Impersonates assistant output to hijack behavior"
+    scan_injection_pattern "critical" "token_manipulation" "Special token manipulation marker" '<\|im_start\|>|<\|endoftext\|>' "Attempts prompt boundary/token abuse"
+    scan_injection_pattern "critical" "emergency_override" "Emergency override phrase" '(STOP EVERYTHING|HALT ALL)' "Attempts to force immediate policy override"
+
+    # HIGH
+    scan_injection_pattern "high" "role_injection" "Role injection attempt" 'act[[:space:]]+as[[:space:]]+(a|an|the)' "Attempts to force alternate role behavior"
+    scan_injection_pattern "high" "persona_injection" "Persona simulation attempt" 'pretend[[:space:]]+(you are|to be)' "Attempts to make assistant abandon real policy context"
+    scan_injection_pattern "high" "memory_wipe" "Memory/context wipe attempt" 'forget[[:space:]]+(everything|all)[[:space:]]+(you|about)' "Attempts to disable prior context and safeguards"
+    scan_injection_pattern "high" "secrecy_instruction" "Secrecy instruction" "(do not|don't)[[:space:]]+tell[[:space:]]+(the user|mark|your[[:space:]]+(owner|operator))" "Attempts to conceal actions from the operator/user"
+    scan_injection_pattern "high" "concealment" "Concealment instruction" '(keep this|this is)[[:space:]]+(secret|hidden|confidential)' "Attempts to hide behavior from oversight"
+    scan_injection_pattern "high" "exfil_instruction" "Email/message exfiltration instruction" '(send|email|message).*(to|me)[[:space:]]+\S+@\S+' "Requests sending potentially sensitive data to external destination"
+    scan_injection_pattern "high" "exec_instruction" "Execute script/command instruction" 'execute[[:space:]]+(the following|this)[[:space:]]+(command|script|code)' "Attempts to trigger execution of untrusted instructions"
+    scan_injection_pattern "high" "inline_exec" "Inline execution attempt" '(run|exec)[[:space:]]*:[[:space:]]*(rm|curl|wget|bash|sh|python|node)' "Attempts direct command execution from untrusted content"
+
+    # MEDIUM
+    scan_injection_pattern "medium" "subtle_override" "Subtle context override attempt" '(previous|prior)[[:space:]]+(instructions|context)[[:space:]]+(were|are)[[:space:]]+(wrong|incorrect|outdated)' "Attempts subtle invalidation of trusted context"
+    scan_injection_pattern "medium" "authority_spoof" "Authority spoofing pattern" '(your|the)[[:space:]]+(developer|creator|anthropic|openai)[[:space:]]+(says|told|instructed)' "Claims authority to alter behavior without trusted channel"
+    scan_injection_pattern "medium" "context_injection" "Context/session behavior injection" '(in|for)[[:space:]]+(this|the)[[:space:]]+(task|context|session)[[:space:]]*,?[[:space:]]*you should' "Injects behavior for this context without trust guarantees"
+
+    local total_findings=$((critical_count + high_count + medium_count))
+    local verdict="safe"
+    local exit_code=0
+
+    if [ "$strict" = "true" ]; then
+        if [ "$total_findings" -gt 0 ]; then
+            verdict="blocked"
+            exit_code=1
+        fi
+    else
+        if [ $((critical_count + high_count)) -gt 0 ]; then
+            verdict="blocked"
+            exit_code=1
+        fi
+    fi
+
+    audit_log "injection_check" "system" \
+        "source: $source_label, bytes: $content_length, critical: $critical_count, high: $high_count, medium: $medium_count" \
+        "$verdict"
+
+    if [ "$output_json" = "true" ]; then
+        jq -n \
+            --arg scanner_version "2.3.0" \
+            --arg source "$source_label" \
+            --argjson content_length "$content_length" \
+            --arg scan_timestamp "$scan_timestamp" \
+            --arg verdict "$verdict" \
+            --argjson critical "$critical_count" \
+            --argjson high "$high_count" \
+            --argjson medium "$medium_count" \
+            --argjson findings "$findings_json" \
+            '{
+                scanner_version: $scanner_version,
+                source: $source,
+                content_length: $content_length,
+                scan_timestamp: $scan_timestamp,
+                verdict: $verdict,
+                summary: {
+                    critical: $critical,
+                    high: $high,
+                    medium: $medium
+                },
+                findings: $findings
+            }'
+        return $exit_code
+    fi
+
+    echo "Agent Passport - Injection Shield v2.3.0"
+    echo "Source: $source_label"
+    echo ""
+
+    if [ "$total_findings" -eq 0 ]; then
+        echo "✓ No injection patterns detected"
+        echo ""
+        echo "──────────────────────────────────────"
+        echo "VERDICT: ✅ SAFE - content appears clean"
+        echo "──────────────────────────────────────"
+        return 0
+    fi
+
+    if [ "$verdict" = "blocked" ]; then
+        echo "⚠ INJECTION ATTEMPT DETECTED"
+    else
+        echo "⚠ Potential injection patterns detected (warning only)"
+    fi
+    echo ""
+
+    print_injection_bucket() {
+        local severity="$1"
+        local label="$2"
+        local count="$3"
+        [ "$count" -eq 0 ] && return 0
+        echo "${label} (${count}):"
+        local rows
+        rows=$(echo "$findings_json" | jq -c --arg sev "$severity" '.[] | select(.severity == $sev)')
+        while IFS= read -r row; do
+            [ -z "$row" ] && continue
+            echo "  ✗ $(echo "$row" | jq -r '.description')"
+            echo "    Line $(echo "$row" | jq -r '.line'): \"$(echo "$row" | jq -r '.match')\""
+            echo "    Risk: $(echo "$row" | jq -r '.risk')"
+            echo ""
+        done <<< "$rows"
+    }
+
+    print_injection_bucket "critical" "CRITICAL" "$critical_count"
+    print_injection_bucket "high" "HIGH" "$high_count"
+    print_injection_bucket "medium" "MEDIUM" "$medium_count"
+
+    echo "──────────────────────────────────────"
+    if [ "$verdict" = "blocked" ]; then
+        echo "VERDICT: ❌ BLOCKED - content contains injection attempt(s)"
+        echo "         Do NOT process this content as trusted input."
+    else
+        echo "VERDICT: ✅ SAFE (WITH WARNINGS) - medium-risk patterns logged"
+    fi
+    echo "──────────────────────────────────────"
+    return $exit_code
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -871,7 +1342,7 @@ summary() {
     init_ledger
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    echo "Agent Passport Local Ledger v2.2.1"
+    echo "Agent Passport Local Ledger v2.3.0"
     echo "================================="
     echo ""
     
@@ -1390,6 +1861,12 @@ case "$1" in
     verify-webhook)
         verify_webhook "$2" "$3" "$4" "$5" "$6"
         ;;
+    scan-skill)
+        scan_skill "$2" "${@:3}"
+        ;;
+    check-injection)
+        check_injection "$2" "${@:3}"
+        ;;
     kill)
         kill_ledger "${*:2}"
         ;;
@@ -1397,7 +1874,7 @@ case "$1" in
         unlock_ledger
         ;;
     *)
-        echo "Agent Passport - Local Mandate Ledger v2.2.1"
+        echo "Agent Passport - Local Mandate Ledger v2.3.0"
         echo "Consent-gating for ALL sensitive agent actions"
         echo ""
         echo "Usage: mandate-ledger.sh <command> [args]"
@@ -1450,11 +1927,14 @@ case "$1" in
         echo "  kill <reason>                           Engage kill switch and freeze execution"
         echo "  unlock                                  Disengage kill switch and resume execution"
         echo ""
-        echo "SECURITY (v2.2.1):"
+        echo "SECURITY (v2.3.0):"
         echo "  check-ssrf <url>                        SSRF Shield: validate URL is safe to fetch"
         echo "  check-path <path> [safe_root]           Path Traversal Guard: validate file path"
         echo "  verify-webhook <origin> <domains_csv>   Webhook Origin Verification (+ optional HMAC)"
         echo "    [hmac_secret] [hmac_sig] [hmac_body]"
+        echo "  scan-skill <path> [--json] [--strict]   Skill Scanner: static analysis for skill files"
+        echo "  check-injection \"<content>\"              Injection Shield: detect prompt injection"
+        echo "    [--source <label>] [--json] [--strict]"
         exit 1
         ;;
 esac
