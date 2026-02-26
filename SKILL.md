@@ -175,9 +175,9 @@ Allowlists and deny lists support three wildcard styles:
 
 ## Modes
 
-- **Local mode** (default): Full offline operation. Mandates stored in `~/.openclaw/agent-passport/`.
+- **Local mode** (default): Mandates stored in `~/.openclaw/agent-passport/`. Free tier is fully offline. Pro tier makes periodic API calls to `api.agentpassportai.com` for license validation and threat definition updates.
 - **Preview mode:** No storage, no network. Generates validated payloads and curl templates.
-- **Live mode (roadmap):** Future connection to Agent Bridge backend for multi-agent sync and compliance. Not yet implemented — this skill is fully offline.
+- **Live mode (roadmap):** Future connection to Agent Bridge backend for multi-agent sync and compliance. Not yet implemented.
 
 ## Quick Start Commands
 
@@ -282,7 +282,7 @@ kya-revoke <agent_id> [why]
 
 ## Agent Bridge (Future Roadmap)
 
-> **Note:** This skill is 100% local. It makes NO network calls. Agent Bridge is a planned future service — no networking code is included in this release. No API keys are required.
+> **Note:** Free tier is fully local with no network calls. Pro tier (`AGENT_PASSPORT_LICENSE_KEY` set) makes periodic HTTPS calls to `api.agentpassportai.com` for license validation and threat definition updates. No usage data or scan results are transmitted. Agent Bridge is a planned future service.
 
 Local mode handles single-user, single-agent scenarios. A future Agent Bridge service would add:
 

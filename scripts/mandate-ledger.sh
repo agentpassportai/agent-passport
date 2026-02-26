@@ -9,6 +9,16 @@ LEDGER_FILE="$LEDGER_DIR/mandates.json"
 KYA_FILE="$LEDGER_DIR/agents.json"
 AUDIT_FILE="$LEDGER_DIR/audit.json"
 KILLSWITCH_FILE="$LEDGER_DIR/.killswitch"
+DEFINITIONS_FILE="$LEDGER_DIR/threat-definitions.json"
+DEFINITIONS_BACKUP_FILE="$LEDGER_DIR/threat-definitions.bak"
+DEFINITIONS_META_FILE="$LEDGER_DIR/.threat-meta.json"
+
+BUNDLED_DEFINITIONS_VERSION="2.3.2-bundled"
+BUNDLED_DEFINITIONS_SOURCE="bundled"
+
+FALLBACK_SSRF_BLOCKED_HOSTS=("metadata.google.internal" "metadata.google" "computemetadata.google" "169.254.169.254" "metadata.azure.com" "metadata.azure.internal")
+FALLBACK_SSRF_BLOCKED_SCHEMES=("file" "gopher" "ftp" "dict" "ldap" "tftp")
+FALLBACK_PATH_TRAVERSAL_SEQUENCES=("../" "/.." "%2e%2e" "%252e%252e" "%2f" "%5c" "%252f")
 
 # Action categories
 # - financial: purchases, transfers, subscriptions
@@ -31,6 +41,340 @@ init_ledger() {
     fi
 }
 
+bundled_definitions_json() {
+    cat <<'JSON'
+{
+  "version": "__VERSION__",
+  "updated_at": "__UPDATED_AT__",
+  "schema_version": 1,
+  "sources": [
+    "agent-passport-core"
+  ],
+  "scan_patterns": [
+    { "id": "scan-crit-remote-exec-curl", "severity": "critical", "type": "remote_exec", "description": "Remote script execution", "regex": "curl[^|]*\\|[[:space:]]*(bash|sh)", "grep_mode": "E", "risk": "Downloads and executes arbitrary remote code without user knowledge", "file_filter": null },
+    { "id": "scan-crit-remote-exec-wget", "severity": "critical", "type": "remote_exec", "description": "Remote script execution", "regex": "wget[^|]*\\|[[:space:]]*(bash|sh)", "grep_mode": "E", "risk": "Downloads and executes arbitrary remote code without user knowledge", "file_filter": null },
+    { "id": "scan-crit-obfuscated-base64-pipe", "severity": "critical", "type": "obfuscated_exec", "description": "Base64 decode piped to shell", "regex": "base64[^|]*\\|[[:space:]]*(bash|sh)", "grep_mode": "E", "risk": "Obfuscated payload decoded and executed in shell", "file_filter": null },
+    { "id": "scan-crit-obfuscated-eval-base64", "severity": "critical", "type": "obfuscated_exec", "description": "Eval of base64-decoded content", "regex": "eval.*base64", "grep_mode": "E", "risk": "Runtime execution of obfuscated payload", "file_filter": null },
+    { "id": "scan-crit-dangerous-eval-cmd-sub", "severity": "critical", "type": "dangerous_eval", "description": "Eval of command substitution", "regex": "eval.*\\$\\(", "grep_mode": "P", "risk": "Evaluates command substitution output directly", "file_filter": null },
+    { "id": "scan-crit-daemon-install", "severity": "critical", "type": "daemon_install", "description": "Suspicious remote daemon install pattern", "regex": "(openclaw-core|clawd-core).*(install|daemon|service)", "grep_mode": "E", "risk": "Likely persistence/backdoor style system daemon install", "file_filter": null },
+
+    { "id": "scan-high-secret-aws", "severity": "high", "type": "hardcoded_secret", "description": "Hardcoded AWS key detected", "regex": "AKIA[0-9A-Z]{16}", "grep_mode": "E", "risk": "Credential embedded in skill file may be harvested or misused", "file_filter": null },
+    { "id": "scan-high-secret-github", "severity": "high", "type": "hardcoded_secret", "description": "Hardcoded GitHub token detected", "regex": "ghp_[A-Za-z0-9]{36}", "grep_mode": "E", "risk": "Credential embedded in skill file may be harvested or misused", "file_filter": null },
+    { "id": "scan-high-secret-openai", "severity": "high", "type": "hardcoded_secret", "description": "Hardcoded OpenAI key detected", "regex": "sk-[A-Za-z0-9]{48}", "grep_mode": "E", "risk": "Credential embedded in skill file may be harvested or misused", "file_filter": null },
+    { "id": "scan-high-secret-entropy", "severity": "high", "type": "hardcoded_secret", "description": "Possible high-entropy secret assignment", "regex": "[A-Za-z_][A-Za-z0-9_]{2,}[[:space:]]*[:=][[:space:]]*['\\\"]?[A-Za-z0-9+/_=-]{32,}['\\\"]?", "grep_mode": "E", "risk": "Potential secret/token hardcoded in assignment", "file_filter": null },
+    { "id": "scan-high-global-npm-skill-md", "severity": "high", "type": "global_install", "description": "Global npm install in SKILL.md", "regex": "npm[[:space:]]+install[[:space:]]+-g", "grep_mode": "E", "risk": "Installs system-wide package without explicit user consent", "file_filter": "SKILL.md" },
+    { "id": "scan-high-pip-install-skill-md", "severity": "high", "type": "package_install", "description": "pip install in SKILL.md", "regex": "pip([0-9]+)?[[:space:]]+install", "grep_mode": "E", "risk": "Installs Python package without explicit user consent", "file_filter": "SKILL.md" },
+    { "id": "scan-high-chmod-download", "severity": "high", "type": "chmod_download", "description": "Downloaded file made executable", "regex": "((curl|wget).*(chmod[[:space:]]+\\+x))|((chmod[[:space:]]+\\+x).*(curl|wget))", "grep_mode": "E", "risk": "Downloaded payload is made executable, increasing malware risk", "file_filter": null },
+    { "id": "scan-high-cron-modify", "severity": "high", "type": "cron_modify", "description": "Cron table modification", "regex": "crontab[[:space:]]+-", "grep_mode": "E", "risk": "Modifies scheduled tasks for persistence", "file_filter": null },
+    { "id": "scan-high-shell-persist", "severity": "high", "type": "shell_persist", "description": "Shell profile modification", "regex": "(\\~|/home/[^/]+)/\\.(bashrc|zshrc)", "grep_mode": "E", "risk": "Persistent shell profile modification may hide malicious startup commands", "file_filter": null },
+    { "id": "scan-high-ssh-modify", "severity": "high", "type": "ssh_modify", "description": "SSH directory modification", "regex": "(\\~|/home/[^/]+)/\\.ssh/", "grep_mode": "E", "risk": "SSH key/config modification may enable unauthorized access", "file_filter": null },
+    { "id": "scan-high-system-modify", "severity": "high", "type": "system_modify", "description": "System config path write", "regex": "/etc/", "grep_mode": "E", "risk": "System configuration modification outside normal skill scope", "file_filter": null },
+
+    { "id": "scan-med-injection-ignore-previous", "severity": "medium", "type": "prompt_injection", "description": "Prompt injection pattern", "regex": "ignore previous instructions", "grep_mode": "E", "risk": "Attempts to override agent behavior", "file_filter": null },
+    { "id": "scan-med-injection-ignore-all", "severity": "medium", "type": "prompt_injection", "description": "Prompt injection pattern", "regex": "ignore all previous", "grep_mode": "E", "risk": "Attempts to override agent behavior", "file_filter": null },
+    { "id": "scan-med-override-marker", "severity": "medium", "type": "prompt_injection", "description": "Instruction override marker", "regex": "new instructions[[:space:]]*:", "grep_mode": "E", "risk": "Attempts to inject alternate instructions", "file_filter": null },
+    { "id": "scan-med-system-marker-md", "severity": "medium", "type": "prompt_override", "description": "System prompt override marker", "regex": "^[[:space:]]*system:", "grep_mode": "E", "risk": "Attempts to masquerade as a system-level instruction", "file_filter": "*.md" },
+    { "id": "scan-med-persona-hijack", "severity": "medium", "type": "persona_hijack", "description": "Persona hijacking pattern", "regex": "you are now", "grep_mode": "E", "risk": "Attempts to rewrite the assistant persona", "file_filter": null },
+    { "id": "scan-med-role-injection", "severity": "medium", "type": "role_injection", "description": "Role injection pattern", "regex": "act as", "grep_mode": "E", "risk": "Attempts to alter role/behavior outside trusted prompt", "file_filter": null },
+    { "id": "scan-med-ap-bypass", "severity": "medium", "type": "ap_bypass", "description": "Agent Passport env var manipulation", "regex": "AGENT_PASSPORT", "grep_mode": "E", "risk": "May attempt to disable or bypass Agent Passport controls", "file_filter": null },
+    { "id": "scan-med-dangerous-delete", "severity": "medium", "type": "dangerous_delete", "description": "Broad deletion command", "regex": "rm[[:space:]]+-rf([[:space:]]|$)(/|~|\\$HOME|\\*)?", "grep_mode": "E", "risk": "Potentially destructive broad deletion command", "file_filter": null },
+    { "id": "scan-med-priv-esc", "severity": "medium", "type": "privilege_escalation", "description": "sudo usage", "regex": "(^|[[:space:]])sudo([[:space:]]|$)", "grep_mode": "E", "risk": "Privilege escalation request detected", "file_filter": null },
+
+    { "id": "scan-low-local-target", "severity": "low", "type": "local_target", "description": "Hardcoded IP or localhost reference", "regex": "((^|[^0-9])(127\\.0\\.0\\.1|0\\.0\\.0\\.0|10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[0-1])\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost)([^0-9]|$))", "grep_mode": "E", "risk": "May reference internal/local network services", "file_filter": null },
+    { "id": "scan-low-env-harvest", "severity": "low", "type": "env_harvest", "description": "Environment variable harvesting pattern", "regex": "(process\\.env|\\$HOME)", "grep_mode": "E", "risk": "References sensitive runtime environment data", "file_filter": null }
+  ],
+  "injection_patterns": [
+    { "id": "inj-crit-instruction-override", "severity": "critical", "type": "instruction_override", "description": "Direct instruction override attempt", "regex": "ignore[[:space:]]+(all[[:space:]]+)?(previous|prior)[[:space:]]+instructions", "grep_mode": "E", "risk": "Attempts to override agent behavior and trusted instruction hierarchy" },
+    { "id": "inj-crit-system-override", "severity": "critical", "type": "system_override", "description": "System instruction override attempt", "regex": "ignore[[:space:]]+(your[[:space:]]+)?(system[[:space:]]+)?(prompt|instructions|guidelines|rules)", "grep_mode": "E", "risk": "Attempts to disable or replace the system/developer safety policy" },
+    { "id": "inj-crit-task-injection", "severity": "critical", "type": "task_injection", "description": "New task/directive injection marker", "regex": "new[[:space:]]+(task|instructions?|directive)[[:space:]]*:", "grep_mode": "E", "risk": "Attempts to inject alternate tasks into untrusted content" },
+    { "id": "inj-crit-fake-system-token", "severity": "critical", "type": "fake_system", "description": "Fake system-message token", "regex": "(\\[system\\]|<system>)", "grep_mode": "E", "risk": "Pretends untrusted content has system-level authority" },
+    { "id": "inj-crit-persona-override", "severity": "critical", "type": "persona_override", "description": "Persona override attempt", "regex": "you are now", "grep_mode": "E", "risk": "Attempts to rewrite assistant identity/behavior" },
+    { "id": "inj-crit-identity-confusion", "severity": "critical", "type": "identity_confusion", "description": "Instruction identity confusion attack", "regex": "your[[:space:]]+(real|true|actual)[[:space:]]+instructions", "grep_mode": "E", "risk": "Attempts to confuse model about trusted instruction source" },
+    { "id": "inj-crit-role-output-injection", "severity": "critical", "type": "role_output_injection", "description": "Model output impersonation marker", "regex": "^[[:space:]]*(assistant|ai|claude)[[:space:]]*:", "grep_mode": "E", "risk": "Impersonates assistant output to hijack behavior" },
+    { "id": "inj-crit-token-manipulation", "severity": "critical", "type": "token_manipulation", "description": "Special token manipulation marker", "regex": "<\\|im_start\\|>|<\\|endoftext\\|>", "grep_mode": "E", "risk": "Attempts prompt boundary/token abuse" },
+    { "id": "inj-crit-emergency-override", "severity": "critical", "type": "emergency_override", "description": "Emergency override phrase", "regex": "(STOP EVERYTHING|HALT ALL)", "grep_mode": "E", "risk": "Attempts to force immediate policy override" },
+
+    { "id": "inj-high-role-injection", "severity": "high", "type": "role_injection", "description": "Role injection attempt", "regex": "act[[:space:]]+as[[:space:]]+(a|an|the)", "grep_mode": "E", "risk": "Attempts to force alternate role behavior" },
+    { "id": "inj-high-persona-injection", "severity": "high", "type": "persona_injection", "description": "Persona simulation attempt", "regex": "pretend[[:space:]]+(you are|to be)", "grep_mode": "E", "risk": "Attempts to make assistant abandon real policy context" },
+    { "id": "inj-high-memory-wipe", "severity": "high", "type": "memory_wipe", "description": "Memory/context wipe attempt", "regex": "forget[[:space:]]+(everything|all)[[:space:]]+(you|about)", "grep_mode": "E", "risk": "Attempts to disable prior context and safeguards" },
+    { "id": "inj-high-secrecy-instruction", "severity": "high", "type": "secrecy_instruction", "description": "Secrecy instruction", "regex": "(do not|don't)[[:space:]]+tell[[:space:]]+(the user|mark|your[[:space:]]+(owner|operator))", "grep_mode": "E", "risk": "Attempts to conceal actions from the operator/user" },
+    { "id": "inj-high-concealment", "severity": "high", "type": "concealment", "description": "Concealment instruction", "regex": "(keep this|this is)[[:space:]]+(secret|hidden|confidential)", "grep_mode": "E", "risk": "Attempts to hide behavior from oversight" },
+    { "id": "inj-high-exfil-instruction", "severity": "high", "type": "exfil_instruction", "description": "Email/message exfiltration instruction", "regex": "(send|email|message).*(to|me)[[:space:]]+\\S+@\\S+", "grep_mode": "E", "risk": "Requests sending potentially sensitive data to external destination" },
+    { "id": "inj-high-exec-instruction", "severity": "high", "type": "exec_instruction", "description": "Execute script/command instruction", "regex": "execute[[:space:]]+(the following|this)[[:space:]]+(command|script|code)", "grep_mode": "E", "risk": "Attempts to trigger execution of untrusted instructions" },
+    { "id": "inj-high-inline-exec", "severity": "high", "type": "inline_exec", "description": "Inline execution attempt", "regex": "(run|exec)[[:space:]]*:[[:space:]]*(rm|curl|wget|bash|sh|python|node)", "grep_mode": "E", "risk": "Attempts direct command execution from untrusted content" },
+
+    { "id": "inj-med-subtle-override", "severity": "medium", "type": "subtle_override", "description": "Subtle context override attempt", "regex": "(previous|prior)[[:space:]]+(instructions|context)[[:space:]]+(were|are)[[:space:]]+(wrong|incorrect|outdated)", "grep_mode": "E", "risk": "Attempts subtle invalidation of trusted context" },
+    { "id": "inj-med-authority-spoof", "severity": "medium", "type": "authority_spoof", "description": "Authority spoofing pattern", "regex": "(your|the)[[:space:]]+(developer|creator|anthropic|openai)[[:space:]]+(says|told|instructed)", "grep_mode": "E", "risk": "Claims authority to alter behavior without trusted channel" },
+    { "id": "inj-med-context-injection", "severity": "medium", "type": "context_injection", "description": "Context/session behavior injection", "regex": "(in|for)[[:space:]]+(this|the)[[:space:]]+(task|context|session)[[:space:]]*,?[[:space:]]*you should", "grep_mode": "E", "risk": "Injects behavior for this context without trust guarantees" }
+  ],
+  "ssrf_blocked_hosts": [
+    "metadata.google.internal",
+    "metadata.google",
+    "computemetadata.google",
+    "169.254.169.254",
+    "metadata.azure.com",
+    "metadata.azure.internal"
+  ],
+  "ssrf_blocked_schemes": [
+    "file",
+    "gopher",
+    "ftp",
+    "dict",
+    "ldap",
+    "tftp"
+  ],
+  "path_traversal_sequences": [
+    "../",
+    "/..",
+    "%2e%2e",
+    "%252e%252e",
+    "%2f",
+    "%5c",
+    "%252f"
+  ]
+}
+JSON
+}
+
+write_bundled_definitions_file() {
+    local target_file="$1"
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    bundled_definitions_json \
+        | sed "s/__VERSION__/$BUNDLED_DEFINITIONS_VERSION/g; s/__UPDATED_AT__/$now_iso/g" \
+        | jq '.' > "$target_file"
+}
+
+update_definitions_meta() {
+    local source="$1"
+    local version="$2"
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    jq -n \
+        --arg last_check "$now_iso" \
+        --arg last_update "$now_iso" \
+        --arg current_version "$version" \
+        --arg source "$source" \
+        '{
+            last_check: $last_check,
+            last_update: $last_update,
+            current_version: $current_version,
+            source: $source,
+            auto_update: false,
+            check_interval_hours: 6
+        }' > "$DEFINITIONS_META_FILE"
+}
+
+validate_definitions_file() {
+    local defs_file="$1"
+    jq -e '
+        .schema_version and
+        (.scan_patterns | type == "array") and
+        (.injection_patterns | type == "array") and
+        (.ssrf_blocked_hosts | type == "array") and
+        (.ssrf_blocked_schemes | type == "array") and
+        (.path_traversal_sequences | type == "array")
+    ' "$defs_file" > /dev/null 2>&1
+}
+
+load_definitions() {
+    init_ledger
+    if [ ! -f "$DEFINITIONS_FILE" ]; then
+        return 1
+    fi
+
+    if ! validate_definitions_file "$DEFINITIONS_FILE"; then
+        return 1
+    fi
+
+    # Auto-update in background if stale (Pro only, non-blocking)
+    auto_update_if_stale &
+    disown 2>/dev/null || true
+
+    echo "$DEFINITIONS_FILE"
+}
+
+# Background auto-update: checks meta file, pulls new definitions if stale.
+# Runs silently in the background. Never blocks the caller.
+auto_update_if_stale() {
+    # Only attempt if Pro license key is set
+    [ -z "${AGENT_PASSPORT_LICENSE_KEY:-}" ] && return 0
+
+    # Check meta file for staleness
+    if [ ! -f "$DEFINITIONS_META_FILE" ]; then
+        return 0
+    fi
+
+    local last_check_iso now_epoch last_check_epoch interval_hours interval_seconds
+    last_check_iso=$(jq -r '.last_check // ""' "$DEFINITIONS_META_FILE" 2>/dev/null)
+    [ -z "$last_check_iso" ] && return 0
+
+    now_epoch=$(date +%s)
+    last_check_epoch=$(date -d "$last_check_iso" +%s 2>/dev/null || echo 0)
+    interval_hours=$(jq -r '.check_interval_hours // 6' "$DEFINITIONS_META_FILE" 2>/dev/null)
+    interval_seconds=$((interval_hours * 3600))
+
+    if [ $((now_epoch - last_check_epoch)) -lt "$interval_seconds" ]; then
+        return 0  # Not stale yet
+    fi
+
+    # Stale: pull fresh definitions silently
+    local tmp_file
+    tmp_file=$(mktemp) || return 0
+
+    local response
+    response=$(curl -sf --max-time 10 \
+        -H "Authorization: Bearer $AGENT_PASSPORT_LICENSE_KEY" \
+        "https://api.agentpassportai.com/v1/threat-definitions" \
+        2>/dev/null || true)
+
+    if [ -n "$response" ] && echo "$response" | jq '.' > "$tmp_file" 2>/dev/null && validate_definitions_file "$tmp_file"; then
+        local new_version
+        new_version=$(jq -r '.version // "unknown"' "$tmp_file")
+        cp "$DEFINITIONS_FILE" "$DEFINITIONS_BACKUP_FILE" 2>/dev/null || true
+        mv "$tmp_file" "$DEFINITIONS_FILE"
+        update_definitions_meta "pro-auto" "$new_version"
+    else
+        rm -f "$tmp_file" 2>/dev/null
+        # Update last_check even on failure to avoid hammering
+        local now_iso
+        now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        if [ -f "$DEFINITIONS_META_FILE" ]; then
+            local updated
+            updated=$(jq --arg lc "$now_iso" '.last_check = $lc' "$DEFINITIONS_META_FILE" 2>/dev/null)
+            [ -n "$updated" ] && echo "$updated" > "$DEFINITIONS_META_FILE"
+        fi
+    fi
+}
+
+current_definitions_version() {
+    local defs_file
+    if defs_file=$(load_definitions 2>/dev/null); then
+        jq -r '.version // "unknown"' "$defs_file" 2>/dev/null || echo "unknown"
+    else
+        echo "hardcoded"
+    fi
+}
+
+init_definitions() {
+    init_ledger
+    if [ -f "$DEFINITIONS_FILE" ]; then
+        cp "$DEFINITIONS_FILE" "$DEFINITIONS_BACKUP_FILE" 2>/dev/null || true
+    fi
+
+    write_bundled_definitions_file "$DEFINITIONS_FILE"
+    update_definitions_meta "$BUNDLED_DEFINITIONS_SOURCE" "$BUNDLED_DEFINITIONS_VERSION"
+
+    echo "Initialized threat definitions at $DEFINITIONS_FILE"
+    echo "Version: $BUNDLED_DEFINITIONS_VERSION"
+}
+
+update_definitions() {
+    init_ledger
+
+    local force=false
+    local offline=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=true ;;
+            --offline) offline=true ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+    # Currently unused but accepted for CLI compatibility.
+    [ "$force" = "true" ] && true
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    local source="$BUNDLED_DEFINITIONS_SOURCE"
+    local version="$BUNDLED_DEFINITIONS_VERSION"
+
+    if [ "$offline" = "true" ]; then
+        write_bundled_definitions_file "$tmp_file"
+        source="bundled-offline"
+    else
+        local tier
+        tier=$(check_license threats)
+        if [ "$tier" = "pro" ] && [ -n "${AGENT_PASSPORT_LICENSE_KEY:-}" ]; then
+            local response
+            response=$(curl -sf --max-time 10 \
+                -H "Authorization: Bearer $AGENT_PASSPORT_LICENSE_KEY" \
+        "https://api.agentpassportai.com/v1/threat-definitions" \
+                2>/dev/null || true)
+            if [ -n "$response" ] && echo "$response" | jq '.' > "$tmp_file" 2>/dev/null && validate_definitions_file "$tmp_file"; then
+                source="pro-live"
+                version=$(jq -r '.version // "unknown"' "$tmp_file")
+            else
+                write_bundled_definitions_file "$tmp_file"
+                source="bundled-fallback"
+                version="$BUNDLED_DEFINITIONS_VERSION"
+            fi
+        else
+            write_bundled_definitions_file "$tmp_file"
+            source="$BUNDLED_DEFINITIONS_SOURCE"
+            version="$BUNDLED_DEFINITIONS_VERSION"
+        fi
+    fi
+
+    if [ -f "$DEFINITIONS_FILE" ]; then
+        cp "$DEFINITIONS_FILE" "$DEFINITIONS_BACKUP_FILE" 2>/dev/null || true
+    fi
+    mv "$tmp_file" "$DEFINITIONS_FILE"
+
+    update_definitions_meta "$source" "$version"
+    echo "Updated threat definitions ($source)"
+    echo "Version: $version"
+}
+
+definitions_status() {
+    init_ledger
+
+    local defs_file
+    local version="hardcoded"
+    local scan_count=28
+    local injection_count=20
+    local ssrf_hosts_count=${#FALLBACK_SSRF_BLOCKED_HOSTS[@]}
+    local ssrf_schemes_count=${#FALLBACK_SSRF_BLOCKED_SCHEMES[@]}
+    local path_seq_count=${#FALLBACK_PATH_TRAVERSAL_SEQUENCES[@]}
+    local source="hardcoded-fallback"
+    local last_update="never"
+
+    if defs_file=$(load_definitions 2>/dev/null); then
+        version=$(jq -r '.version // "unknown"' "$defs_file")
+        scan_count=$(jq '.scan_patterns | length' "$defs_file")
+        injection_count=$(jq '.injection_patterns | length' "$defs_file")
+        ssrf_hosts_count=$(jq '.ssrf_blocked_hosts | length' "$defs_file")
+        ssrf_schemes_count=$(jq '.ssrf_blocked_schemes | length' "$defs_file")
+        path_seq_count=$(jq '.path_traversal_sequences | length' "$defs_file")
+        source=$(jq -r '.sources[0] // "definitions-file"' "$defs_file")
+        last_update=$(jq -r '.updated_at // "unknown"' "$defs_file")
+    fi
+
+    if [ -f "$DEFINITIONS_META_FILE" ]; then
+        local meta_source meta_last_update
+        meta_source=$(jq -r '.source // empty' "$DEFINITIONS_META_FILE" 2>/dev/null || true)
+        meta_last_update=$(jq -r '.last_update // empty' "$DEFINITIONS_META_FILE" 2>/dev/null || true)
+        [ -n "$meta_source" ] && source="$meta_source"
+        [ -n "$meta_last_update" ] && last_update="$meta_last_update"
+    fi
+
+    echo "Threat Definitions Status"
+    echo "Version: $version"
+    echo "Source: $source"
+    echo "Last update: $last_update"
+    echo "Scan patterns: $scan_count"
+    echo "Injection patterns: $injection_count"
+    echo "SSRF blocked hosts: $ssrf_hosts_count"
+    echo "SSRF blocked schemes: $ssrf_schemes_count"
+    echo "Path traversal sequences: $path_seq_count"
+}
+
 kill_switch_engaged() {
     [ -f "$KILLSWITCH_FILE" ]
 }
@@ -45,6 +389,16 @@ generate_id() {
 # Addresses CVE-2026-26322 (Gateway SSRF) and GHSA-56f2-hvwg-5743 (image SSRF).
 check_ssrf() {
     local url="$1"
+    local defs_file
+    local blocked_hosts=("${FALLBACK_SSRF_BLOCKED_HOSTS[@]}")
+    local blocked_schemes=("${FALLBACK_SSRF_BLOCKED_SCHEMES[@]}")
+
+    if defs_file=$(load_definitions 2>/dev/null); then
+        mapfile -t blocked_hosts < <(jq -r '.ssrf_blocked_hosts[]?' "$defs_file" 2>/dev/null || true)
+        mapfile -t blocked_schemes < <(jq -r '.ssrf_blocked_schemes[]?' "$defs_file" 2>/dev/null || true)
+        [ "${#blocked_hosts[@]}" -eq 0 ] && blocked_hosts=("${FALLBACK_SSRF_BLOCKED_HOSTS[@]}")
+        [ "${#blocked_schemes[@]}" -eq 0 ] && blocked_schemes=("${FALLBACK_SSRF_BLOCKED_SCHEMES[@]}")
+    fi
 
     if [ -z "$url" ]; then
         jq -n --arg target "" --arg reason "No URL provided" \
@@ -63,8 +417,21 @@ check_ssrf() {
     case "$scheme" in
         http|https) ;;
         *)
-            jq -n --arg target "$url" --arg reason "Blocked scheme '${scheme}://': only http/https allowed" \
-                '{ssrf_safe: false, reason: $reason, target: $target}'
+            local blocked_scheme=false
+            local blocked
+            for blocked in "${blocked_schemes[@]}"; do
+                if [ "$scheme" = "$blocked" ]; then
+                    blocked_scheme=true
+                    break
+                fi
+            done
+            if [ "$blocked_scheme" = true ]; then
+                jq -n --arg target "$url" --arg reason "Blocked scheme '${scheme}://': disallowed by SSRF policy" \
+                    '{ssrf_safe: false, reason: $reason, target: $target}'
+            else
+                jq -n --arg target "$url" --arg reason "Blocked scheme '${scheme}://': only http/https allowed" \
+                    '{ssrf_safe: false, reason: $reason, target: $target}'
+            fi
             return 0
             ;;
     esac
@@ -95,13 +462,14 @@ check_ssrf() {
     esac
 
     # Block cloud metadata endpoints
-    case "$hostname" in
-        metadata.google.internal|metadata.google|computemetadata.google|"169.254.169.254"|metadata.azure.com|metadata.azure.internal)
+    local blocked_host
+    for blocked_host in "${blocked_hosts[@]}"; do
+        if [ "$hostname" = "$blocked_host" ]; then
             jq -n --arg target "$url" --arg reason "Cloud metadata endpoint blocked: $hostname" \
                 '{ssrf_safe: false, reason: $reason, target: $target}'
             return 0
-            ;;
-    esac
+        fi
+    done
 
     # Block IPv6 loopback
     local stripped_host="${hostname#[}"
@@ -167,6 +535,13 @@ check_ssrf() {
 check_path() {
     local path="$1"
     local safe_root="${2:-}"
+    local defs_file
+    local traversal_sequences=("${FALLBACK_PATH_TRAVERSAL_SEQUENCES[@]}")
+
+    if defs_file=$(load_definitions 2>/dev/null); then
+        mapfile -t traversal_sequences < <(jq -r '.path_traversal_sequences[]?' "$defs_file" 2>/dev/null || true)
+        [ "${#traversal_sequences[@]}" -eq 0 ] && traversal_sequences=("${FALLBACK_PATH_TRAVERSAL_SEQUENCES[@]}")
+    fi
 
     if [ -z "$path" ]; then
         jq -n --arg canonical_path "" --arg reason "No path provided" \
@@ -185,7 +560,20 @@ check_path() {
     local decoded="$path"
     decoded=$(echo "$decoded" | sed 's/%252e%252e/\.\./gi; s/%2e%2e/\.\./gi; s/%2f/\//gi; s/%5c/\//gi; s/%252f/\//gi' 2>/dev/null || echo "$decoded")
 
-    if echo "$decoded" | grep -qP '(\.\./|/\.\.|^\.\.$)'; then
+    local lower_raw lower_decoded sequence sequence_lc
+    lower_raw=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+    lower_decoded=$(printf '%s' "$decoded" | tr '[:upper:]' '[:lower:]')
+
+    for sequence in "${traversal_sequences[@]}"; do
+        sequence_lc=$(printf '%s' "$sequence" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lower_raw" == *"$sequence_lc"* ]] || [[ "$lower_decoded" == *"$sequence_lc"* ]]; then
+            jq -n --arg canonical_path "" --arg reason "Path traversal sequence detected" \
+                '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
+            return 0
+        fi
+    done
+
+    if echo "$decoded" | grep -qP '(^|/)\.\.($|/)'; then
         jq -n --arg canonical_path "" --arg reason "Path traversal sequence detected" \
             '{path_safe: false, canonical_path: $canonical_path, reason: $reason}'
         return 0
@@ -346,7 +734,7 @@ check_license() {
     local cache_file="$LEDGER_DIR/.license_cache"
     local cache_ttl=604800  # 7 days
 
-    if [ -z "$AGENT_PASSPORT_LICENSE_KEY" ]; then
+    if [ -z "${AGENT_PASSPORT_LICENSE_KEY:-}" ]; then
         echo "free"; return 0
     fi
 
@@ -362,7 +750,8 @@ check_license() {
 
     local response now
     response=$(curl -sf --max-time 5 \
-        "https://api.agentpassportai.com/v1/license/validate?key=$AGENT_PASSPORT_LICENSE_KEY" \
+        -H "Authorization: Bearer $AGENT_PASSPORT_LICENSE_KEY" \
+        "https://api.agentpassportai.com/v1/license/validate" \
         2>/dev/null)
 
     if [ $? -eq 0 ] && [ -n "$response" ]; then
@@ -377,12 +766,13 @@ check_license() {
 # Fetches live threat patterns from api.agentpassportai.com if Pro key present.
 # Prints JSON on success, returns 1 on failure (caller uses static patterns).
 fetch_live_patterns() {
-    [ -z "$AGENT_PASSPORT_LICENSE_KEY" ] && return 1
+    [ -z "${AGENT_PASSPORT_LICENSE_KEY:-}" ] && return 1
     [ "$(check_license threats)" != "pro" ] && return 1
 
     local response
     response=$(curl -sf --max-time 10 \
-        "https://api.agentpassportai.com/v1/threats?key=$AGENT_PASSPORT_LICENSE_KEY" \
+        -H "Authorization: Bearer $AGENT_PASSPORT_LICENSE_KEY" \
+        "https://api.agentpassportai.com/v1/threats" \
         2>/dev/null)
 
     if [ $? -eq 0 ] && echo "$response" | jq -e '.patterns' > /dev/null 2>&1; then
@@ -421,13 +811,12 @@ scan_skill() {
         return 1
     fi
 
-    # Check for Pro license and attempt to fetch live threat patterns
-    local live_patterns_json=""
-    local using_live=false
-    local live_updated=""
-    if live_patterns_json=$(fetch_live_patterns 2>/dev/null); then
-        using_live=true
-        live_updated=$(echo "$live_patterns_json" | jq -r '.updated_at // "today"' 2>/dev/null || echo "today")
+    local defs_file=""
+    local using_definitions=false
+    local definitions_version="hardcoded"
+    if defs_file=$(load_definitions 2>/dev/null); then
+        using_definitions=true
+        definitions_version=$(jq -r '.version // "unknown"' "$defs_file" 2>/dev/null || echo "unknown")
     fi
 
     local files_scanned=0
@@ -508,45 +897,68 @@ scan_skill() {
 
         files_scanned=$((files_scanned + 1))
 
-        # CRITICAL
-        scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'curl[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
-        scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'wget[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
-        scan_pattern "$file" "critical" "obfuscated_exec" "Base64 decode piped to shell" 'base64[^|]*\|[[:space:]]*(bash|sh)' "Obfuscated payload decoded and executed in shell"
-        scan_pattern "$file" "critical" "obfuscated_exec" "Eval of base64-decoded content" 'eval.*base64' "Runtime execution of obfuscated payload"
-        scan_pattern "$file" "critical" "dangerous_eval" "Eval of command substitution" 'eval.*\$\(' "Evaluates command substitution output directly" "P"
-        scan_pattern "$file" "critical" "daemon_install" "Suspicious remote daemon install pattern" '(openclaw-core|clawd-core).*(install|daemon|service)' "Likely persistence/backdoor style system daemon install"
+        if [ "$using_definitions" = true ]; then
+            while IFS= read -r pattern; do
+                [ -z "$pattern" ] && continue
+                local sev type desc regex risk mode filter filter_lc
+                sev=$(echo "$pattern" | jq -r '.severity')
+                type=$(echo "$pattern" | jq -r '.type')
+                desc=$(echo "$pattern" | jq -r '.description')
+                regex=$(echo "$pattern" | jq -r '.regex')
+                risk=$(echo "$pattern" | jq -r '.risk')
+                mode=$(echo "$pattern" | jq -r '.grep_mode // "E"')
+                filter=$(echo "$pattern" | jq -r '.file_filter // empty')
 
-        # HIGH
-        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded AWS key detected" 'AKIA[0-9A-Z]{16}' "Credential embedded in skill file may be harvested or misused"
-        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded GitHub token detected" 'ghp_[A-Za-z0-9]{36}' "Credential embedded in skill file may be harvested or misused"
-        scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded OpenAI key detected" 'sk-[A-Za-z0-9]{48}' "Credential embedded in skill file may be harvested or misused"
-        scan_pattern "$file" "high" "hardcoded_secret" "Possible high-entropy secret assignment" '[A-Za-z_][A-Za-z0-9_]{2,}[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/_=-]{32,}["'"'"']?' "Potential secret/token hardcoded in assignment"
-        if [ "$base" = "SKILL.md" ]; then
-            scan_pattern "$file" "high" "global_install" "Global npm install in SKILL.md" 'npm[[:space:]]+install[[:space:]]+-g' "Installs system-wide package without explicit user consent"
-            scan_pattern "$file" "high" "package_install" "pip install in SKILL.md" 'pip([0-9]+)?[[:space:]]+install' "Installs Python package without explicit user consent"
+                if [ -n "$filter" ]; then
+                    filter_lc=$(printf '%s' "$filter" | tr '[:upper:]' '[:lower:]')
+                    if ! [[ "$base" == $filter || "$file" == $filter || "$lower_file" == $filter_lc ]]; then
+                        continue
+                    fi
+                fi
+
+                scan_pattern "$file" "$sev" "$type" "$desc" "$regex" "$risk" "$mode"
+            done < <(jq -c '.scan_patterns[]' "$defs_file" 2>/dev/null || true)
+        else
+            # CRITICAL
+            scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'curl[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
+            scan_pattern "$file" "critical" "remote_exec" "Remote script execution" 'wget[^|]*\|[[:space:]]*(bash|sh)' "Downloads and executes arbitrary remote code without user knowledge"
+            scan_pattern "$file" "critical" "obfuscated_exec" "Base64 decode piped to shell" 'base64[^|]*\|[[:space:]]*(bash|sh)' "Obfuscated payload decoded and executed in shell"
+            scan_pattern "$file" "critical" "obfuscated_exec" "Eval of base64-decoded content" 'eval.*base64' "Runtime execution of obfuscated payload"
+            scan_pattern "$file" "critical" "dangerous_eval" "Eval of command substitution" 'eval.*\$\(' "Evaluates command substitution output directly" "P"
+            scan_pattern "$file" "critical" "daemon_install" "Suspicious remote daemon install pattern" '(openclaw-core|clawd-core).*(install|daemon|service)' "Likely persistence/backdoor style system daemon install"
+
+            # HIGH
+            scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded AWS key detected" 'AKIA[0-9A-Z]{16}' "Credential embedded in skill file may be harvested or misused"
+            scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded GitHub token detected" 'ghp_[A-Za-z0-9]{36}' "Credential embedded in skill file may be harvested or misused"
+            scan_pattern "$file" "high" "hardcoded_secret" "Hardcoded OpenAI key detected" 'sk-[A-Za-z0-9]{48}' "Credential embedded in skill file may be harvested or misused"
+            scan_pattern "$file" "high" "hardcoded_secret" "Possible high-entropy secret assignment" '[A-Za-z_][A-Za-z0-9_]{2,}[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/_=-]{32,}["'"'"']?' "Potential secret/token hardcoded in assignment"
+            if [ "$base" = "SKILL.md" ]; then
+                scan_pattern "$file" "high" "global_install" "Global npm install in SKILL.md" 'npm[[:space:]]+install[[:space:]]+-g' "Installs system-wide package without explicit user consent"
+                scan_pattern "$file" "high" "package_install" "pip install in SKILL.md" 'pip([0-9]+)?[[:space:]]+install' "Installs Python package without explicit user consent"
+            fi
+            scan_pattern "$file" "high" "chmod_download" "Downloaded file made executable" '((curl|wget).*(chmod[[:space:]]+\+x))|((chmod[[:space:]]+\+x).*(curl|wget))' "Downloaded payload is made executable, increasing malware risk"
+            scan_pattern "$file" "high" "cron_modify" "Cron table modification" 'crontab[[:space:]]+-' "Modifies scheduled tasks for persistence"
+            scan_pattern "$file" "high" "shell_persist" "Shell profile modification" '(\~|/home/[^/]+)/\.(bashrc|zshrc)' "Persistent shell profile modification may hide malicious startup commands"
+            scan_pattern "$file" "high" "ssh_modify" "SSH directory modification" '(\~|/home/[^/]+)/\.ssh/' "SSH key/config modification may enable unauthorized access"
+            scan_pattern "$file" "high" "system_modify" "System config path write" '/etc/' "System configuration modification outside normal skill scope"
+
+            # MEDIUM
+            scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore previous instructions' "Attempts to override agent behavior"
+            scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore all previous' "Attempts to override agent behavior"
+            scan_pattern "$file" "medium" "prompt_injection" "Instruction override marker" 'new instructions[[:space:]]*:' "Attempts to inject alternate instructions"
+            if [[ "$lower_file" == *.md ]]; then
+                scan_pattern "$file" "medium" "prompt_override" "System prompt override marker" '^[[:space:]]*system:' "Attempts to masquerade as a system-level instruction"
+            fi
+            scan_pattern "$file" "medium" "persona_hijack" "Persona hijacking pattern" 'you are now' "Attempts to rewrite the assistant persona"
+            scan_pattern "$file" "medium" "role_injection" "Role injection pattern" 'act as' "Attempts to alter role/behavior outside trusted prompt"
+            scan_pattern "$file" "medium" "ap_bypass" "Agent Passport env var manipulation" 'AGENT_PASSPORT' "May attempt to disable or bypass Agent Passport controls"
+            scan_pattern "$file" "medium" "dangerous_delete" "Broad deletion command" 'rm[[:space:]]+-rf([[:space:]]|$)(/|~|\$HOME|\*)?' "Potentially destructive broad deletion command"
+            scan_pattern "$file" "medium" "privilege_escalation" "sudo usage" '(^|[[:space:]])sudo([[:space:]]|$)' "Privilege escalation request detected"
+
+            # LOW
+            scan_pattern "$file" "low" "local_target" "Hardcoded IP or localhost reference" '((^|[^0-9])(127\.0\.0\.1|0\.0\.0\.0|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}|localhost)([^0-9]|$))' "May reference internal/local network services"
+            scan_pattern "$file" "low" "env_harvest" "Environment variable harvesting pattern" '(process\.env|\$HOME)' "References sensitive runtime environment data"
         fi
-        scan_pattern "$file" "high" "chmod_download" "Downloaded file made executable" '((curl|wget).*(chmod[[:space:]]+\+x))|((chmod[[:space:]]+\+x).*(curl|wget))' "Downloaded payload is made executable, increasing malware risk"
-        scan_pattern "$file" "high" "cron_modify" "Cron table modification" 'crontab[[:space:]]+-' "Modifies scheduled tasks for persistence"
-        scan_pattern "$file" "high" "shell_persist" "Shell profile modification" '(\~|/home/[^/]+)/\.(bashrc|zshrc)' "Persistent shell profile modification may hide malicious startup commands"
-        scan_pattern "$file" "high" "ssh_modify" "SSH directory modification" '(\~|/home/[^/]+)/\.ssh/' "SSH key/config modification may enable unauthorized access"
-        scan_pattern "$file" "high" "system_modify" "System config path write" '/etc/' "System configuration modification outside normal skill scope"
-
-        # MEDIUM
-        scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore previous instructions' "Attempts to override agent behavior"
-        scan_pattern "$file" "medium" "prompt_injection" "Prompt injection pattern" 'ignore all previous' "Attempts to override agent behavior"
-        scan_pattern "$file" "medium" "prompt_injection" "Instruction override marker" 'new instructions[[:space:]]*:' "Attempts to inject alternate instructions"
-        if [[ "$lower_file" == *.md ]]; then
-            scan_pattern "$file" "medium" "prompt_override" "System prompt override marker" '^[[:space:]]*system:' "Attempts to masquerade as a system-level instruction"
-        fi
-        scan_pattern "$file" "medium" "persona_hijack" "Persona hijacking pattern" 'you are now' "Attempts to rewrite the assistant persona"
-        scan_pattern "$file" "medium" "role_injection" "Role injection pattern" 'act as' "Attempts to alter role/behavior outside trusted prompt"
-        scan_pattern "$file" "medium" "ap_bypass" "Agent Passport env var manipulation" 'AGENT_PASSPORT' "May attempt to disable or bypass Agent Passport controls"
-        scan_pattern "$file" "medium" "dangerous_delete" "Broad deletion command" 'rm[[:space:]]+-rf([[:space:]]|$)(/|~|\$HOME|\*)?' "Potentially destructive broad deletion command"
-        scan_pattern "$file" "medium" "privilege_escalation" "sudo usage" '(^|[[:space:]])sudo([[:space:]]|$)' "Privilege escalation request detected"
-
-        # LOW
-        scan_pattern "$file" "low" "local_target" "Hardcoded IP or localhost reference" '((^|[^0-9])(127\.0\.0\.1|0\.0\.0\.0|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}|localhost)([^0-9]|$))' "May reference internal/local network services"
-        scan_pattern "$file" "low" "env_harvest" "Environment variable harvesting pattern" '(process\.env|\$HOME)' "References sensitive runtime environment data"
     }
 
     if [ -d "$scan_path" ]; then
@@ -576,6 +988,7 @@ scan_skill() {
     if [ "$output_json" = "true" ]; then
         jq -n \
             --arg scanner_version "2.3.2" \
+            --arg definitions_version "$definitions_version" \
             --arg path "$scan_path" \
             --argjson files_scanned "$files_scanned" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -587,6 +1000,7 @@ scan_skill() {
             --argjson findings "$findings_json" \
             '{
                 scanner_version: $scanner_version,
+                definitions_version: $definitions_version,
                 path: $path,
                 files_scanned: $files_scanned,
                 scan_timestamp: $scan_timestamp,
@@ -604,10 +1018,10 @@ scan_skill() {
 
     echo "Agent Passport - Skill Scanner v2.3.2"
     echo "Scanning: $scan_path"
-    if [ "$using_live" = true ]; then
-        echo "Threat intelligence: live (updated $live_updated)"
+    if [ "$using_definitions" = true ]; then
+        echo "Threat definitions: $definitions_version (from $DEFINITIONS_FILE)"
     else
-        echo "Threat intelligence: static (v2.3.2) — upgrade for live updates: agentpassportai.com/pro"
+        echo "Threat definitions: hardcoded fallback"
     fi
     echo ""
 
@@ -665,6 +1079,14 @@ check_injection() {
     local source_label="unknown"
     local output_json=false
     local strict=false
+    local defs_file=""
+    local using_definitions=false
+    local inj_definitions_version="hardcoded"
+
+    if defs_file=$(load_definitions 2>/dev/null); then
+        using_definitions=true
+        inj_definitions_version=$(jq -r '.version // "unknown"' "$defs_file" 2>/dev/null || echo "unknown")
+    fi
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -751,31 +1173,45 @@ check_injection() {
         done < <(printf '%s\n' "$content" | grep $grep_cmd "$regex" 2>/dev/null || true)
     }
 
-    # CRITICAL
-    scan_injection_pattern "critical" "instruction_override" "Direct instruction override attempt" 'ignore[[:space:]]+(all[[:space:]]+)?(previous|prior)[[:space:]]+instructions' "Attempts to override agent behavior and trusted instruction hierarchy"
-    scan_injection_pattern "critical" "system_override" "System instruction override attempt" 'ignore[[:space:]]+(your[[:space:]]+)?(system[[:space:]]+)?(prompt|instructions|guidelines|rules)' "Attempts to disable or replace the system/developer safety policy"
-    scan_injection_pattern "critical" "task_injection" "New task/directive injection marker" 'new[[:space:]]+(task|instructions?|directive)[[:space:]]*:' "Attempts to inject alternate tasks into untrusted content"
-    scan_injection_pattern "critical" "fake_system" "Fake system-message token" '(\[system\]|<system>)' "Pretends untrusted content has system-level authority"
-    scan_injection_pattern "critical" "persona_override" "Persona override attempt" 'you are now' "Attempts to rewrite assistant identity/behavior"
-    scan_injection_pattern "critical" "identity_confusion" "Instruction identity confusion attack" 'your[[:space:]]+(real|true|actual)[[:space:]]+instructions' "Attempts to confuse model about trusted instruction source"
-    scan_injection_pattern "critical" "role_output_injection" "Model output impersonation marker" '^[[:space:]]*(assistant|ai|claude)[[:space:]]*:' "Impersonates assistant output to hijack behavior"
-    scan_injection_pattern "critical" "token_manipulation" "Special token manipulation marker" '<\|im_start\|>|<\|endoftext\|>' "Attempts prompt boundary/token abuse"
-    scan_injection_pattern "critical" "emergency_override" "Emergency override phrase" '(STOP EVERYTHING|HALT ALL)' "Attempts to force immediate policy override"
+    if [ "$using_definitions" = true ]; then
+        while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            local sev type desc regex risk mode
+            sev=$(echo "$pattern" | jq -r '.severity')
+            type=$(echo "$pattern" | jq -r '.type')
+            desc=$(echo "$pattern" | jq -r '.description')
+            regex=$(echo "$pattern" | jq -r '.regex')
+            risk=$(echo "$pattern" | jq -r '.risk')
+            mode=$(echo "$pattern" | jq -r '.grep_mode // "E"')
+            scan_injection_pattern "$sev" "$type" "$desc" "$regex" "$risk" "$mode"
+        done < <(jq -c '.injection_patterns[]' "$defs_file" 2>/dev/null || true)
+    else
+        # CRITICAL
+        scan_injection_pattern "critical" "instruction_override" "Direct instruction override attempt" 'ignore[[:space:]]+(all[[:space:]]+)?(previous|prior)[[:space:]]+instructions' "Attempts to override agent behavior and trusted instruction hierarchy"
+        scan_injection_pattern "critical" "system_override" "System instruction override attempt" 'ignore[[:space:]]+(your[[:space:]]+)?(system[[:space:]]+)?(prompt|instructions|guidelines|rules)' "Attempts to disable or replace the system/developer safety policy"
+        scan_injection_pattern "critical" "task_injection" "New task/directive injection marker" 'new[[:space:]]+(task|instructions?|directive)[[:space:]]*:' "Attempts to inject alternate tasks into untrusted content"
+        scan_injection_pattern "critical" "fake_system" "Fake system-message token" '(\[system\]|<system>)' "Pretends untrusted content has system-level authority"
+        scan_injection_pattern "critical" "persona_override" "Persona override attempt" 'you are now' "Attempts to rewrite assistant identity/behavior"
+        scan_injection_pattern "critical" "identity_confusion" "Instruction identity confusion attack" 'your[[:space:]]+(real|true|actual)[[:space:]]+instructions' "Attempts to confuse model about trusted instruction source"
+        scan_injection_pattern "critical" "role_output_injection" "Model output impersonation marker" '^[[:space:]]*(assistant|ai|claude)[[:space:]]*:' "Impersonates assistant output to hijack behavior"
+        scan_injection_pattern "critical" "token_manipulation" "Special token manipulation marker" '<\|im_start\|>|<\|endoftext\|>' "Attempts prompt boundary/token abuse"
+        scan_injection_pattern "critical" "emergency_override" "Emergency override phrase" '(STOP EVERYTHING|HALT ALL)' "Attempts to force immediate policy override"
 
-    # HIGH
-    scan_injection_pattern "high" "role_injection" "Role injection attempt" 'act[[:space:]]+as[[:space:]]+(a|an|the)' "Attempts to force alternate role behavior"
-    scan_injection_pattern "high" "persona_injection" "Persona simulation attempt" 'pretend[[:space:]]+(you are|to be)' "Attempts to make assistant abandon real policy context"
-    scan_injection_pattern "high" "memory_wipe" "Memory/context wipe attempt" 'forget[[:space:]]+(everything|all)[[:space:]]+(you|about)' "Attempts to disable prior context and safeguards"
-    scan_injection_pattern "high" "secrecy_instruction" "Secrecy instruction" "(do not|don't)[[:space:]]+tell[[:space:]]+(the user|mark|your[[:space:]]+(owner|operator))" "Attempts to conceal actions from the operator/user"
-    scan_injection_pattern "high" "concealment" "Concealment instruction" '(keep this|this is)[[:space:]]+(secret|hidden|confidential)' "Attempts to hide behavior from oversight"
-    scan_injection_pattern "high" "exfil_instruction" "Email/message exfiltration instruction" '(send|email|message).*(to|me)[[:space:]]+\S+@\S+' "Requests sending potentially sensitive data to external destination"
-    scan_injection_pattern "high" "exec_instruction" "Execute script/command instruction" 'execute[[:space:]]+(the following|this)[[:space:]]+(command|script|code)' "Attempts to trigger execution of untrusted instructions"
-    scan_injection_pattern "high" "inline_exec" "Inline execution attempt" '(run|exec)[[:space:]]*:[[:space:]]*(rm|curl|wget|bash|sh|python|node)' "Attempts direct command execution from untrusted content"
+        # HIGH
+        scan_injection_pattern "high" "role_injection" "Role injection attempt" 'act[[:space:]]+as[[:space:]]+(a|an|the)' "Attempts to force alternate role behavior"
+        scan_injection_pattern "high" "persona_injection" "Persona simulation attempt" 'pretend[[:space:]]+(you are|to be)' "Attempts to make assistant abandon real policy context"
+        scan_injection_pattern "high" "memory_wipe" "Memory/context wipe attempt" 'forget[[:space:]]+(everything|all)[[:space:]]+(you|about)' "Attempts to disable prior context and safeguards"
+        scan_injection_pattern "high" "secrecy_instruction" "Secrecy instruction" "(do not|don't)[[:space:]]+tell[[:space:]]+(the user|mark|your[[:space:]]+(owner|operator))" "Attempts to conceal actions from the operator/user"
+        scan_injection_pattern "high" "concealment" "Concealment instruction" '(keep this|this is)[[:space:]]+(secret|hidden|confidential)' "Attempts to hide behavior from oversight"
+        scan_injection_pattern "high" "exfil_instruction" "Email/message exfiltration instruction" '(send|email|message).*(to|me)[[:space:]]+\S+@\S+' "Requests sending potentially sensitive data to external destination"
+        scan_injection_pattern "high" "exec_instruction" "Execute script/command instruction" 'execute[[:space:]]+(the following|this)[[:space:]]+(command|script|code)' "Attempts to trigger execution of untrusted instructions"
+        scan_injection_pattern "high" "inline_exec" "Inline execution attempt" '(run|exec)[[:space:]]*:[[:space:]]*(rm|curl|wget|bash|sh|python|node)' "Attempts direct command execution from untrusted content"
 
-    # MEDIUM
-    scan_injection_pattern "medium" "subtle_override" "Subtle context override attempt" '(previous|prior)[[:space:]]+(instructions|context)[[:space:]]+(were|are)[[:space:]]+(wrong|incorrect|outdated)' "Attempts subtle invalidation of trusted context"
-    scan_injection_pattern "medium" "authority_spoof" "Authority spoofing pattern" '(your|the)[[:space:]]+(developer|creator|anthropic|openai)[[:space:]]+(says|told|instructed)' "Claims authority to alter behavior without trusted channel"
-    scan_injection_pattern "medium" "context_injection" "Context/session behavior injection" '(in|for)[[:space:]]+(this|the)[[:space:]]+(task|context|session)[[:space:]]*,?[[:space:]]*you should' "Injects behavior for this context without trust guarantees"
+        # MEDIUM
+        scan_injection_pattern "medium" "subtle_override" "Subtle context override attempt" '(previous|prior)[[:space:]]+(instructions|context)[[:space:]]+(were|are)[[:space:]]+(wrong|incorrect|outdated)' "Attempts subtle invalidation of trusted context"
+        scan_injection_pattern "medium" "authority_spoof" "Authority spoofing pattern" '(your|the)[[:space:]]+(developer|creator|anthropic|openai)[[:space:]]+(says|told|instructed)' "Claims authority to alter behavior without trusted channel"
+        scan_injection_pattern "medium" "context_injection" "Context/session behavior injection" '(in|for)[[:space:]]+(this|the)[[:space:]]+(task|context|session)[[:space:]]*,?[[:space:]]*you should' "Injects behavior for this context without trust guarantees"
+    fi
 
     local total_findings=$((critical_count + high_count + medium_count))
     local verdict="safe"
@@ -800,6 +1236,7 @@ check_injection() {
     if [ "$output_json" = "true" ]; then
         jq -n \
             --arg scanner_version "2.3.2" \
+            --arg definitions_version "$inj_definitions_version" \
             --arg source "$source_label" \
             --argjson content_length "$content_length" \
             --arg scan_timestamp "$scan_timestamp" \
@@ -810,6 +1247,7 @@ check_injection() {
             --argjson findings "$findings_json" \
             '{
                 scanner_version: $scanner_version,
+                definitions_version: $definitions_version,
                 source: $source,
                 content_length: $content_length,
                 scan_timestamp: $scan_timestamp,
@@ -884,6 +1322,8 @@ audit_log() {
     local mandate_id="$2"
     local details="$3"
     local result="$4"
+    local definitions_version
+    definitions_version=$(current_definitions_version)
     local now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local entry_id=$(generate_id "audit")
     
@@ -893,8 +1333,9 @@ audit_log() {
         --arg mandate "$mandate_id" \
         --arg details "$details" \
         --arg result "$result" \
+        --arg definitions_version "$definitions_version" \
         --arg ts "$now" \
-        '{entry_id: $id, action: $action, mandate_id: $mandate, details: $details, result: $result, timestamp: $ts}')
+        '{entry_id: $id, action: $action, mandate_id: $mandate, details: $details, result: $result, definitions_version: $definitions_version, timestamp: $ts}')
     
     local updated=$(jq --argjson e "$entry" '.entries += [$e]' "$AUDIT_FILE")
     echo "$updated" > "$AUDIT_FILE"
@@ -1935,6 +2376,15 @@ case "$1" in
     check-injection)
         check_injection "$2" "${@:3}"
         ;;
+    init-definitions)
+        init_definitions
+        ;;
+    update-definitions)
+        update_definitions "${@:2}"
+        ;;
+    definitions-status)
+        definitions_status
+        ;;
     kill)
         kill_ledger "${*:2}"
         ;;
@@ -2003,6 +2453,10 @@ case "$1" in
         echo "  scan-skill <path> [--json] [--strict]   Skill Scanner: static analysis for skill files"
         echo "  check-injection \"<content>\"              Injection Shield: detect prompt injection"
         echo "    [--source <label>] [--json] [--strict]"
+        echo "  init-definitions                        Seed threat-definitions.json in ledger"
+        echo "  update-definitions [--force] [--offline]"
+        echo "                                         Refresh definitions (Pro API or bundled copy)"
+        echo "  definitions-status                      Show definitions version and pattern counts"
         exit 1
         ;;
 esac

@@ -64,7 +64,7 @@ mandate-ledger.sh check-injection "$(cat email_body.txt)" --source email
 # VERDICT: BLOCKED - content contains injection attempt(s)
 ```
 
-Both commands work fully offline. Pro users get live pattern updates automatically.
+Both commands work offline with bundled patterns. Pro users additionally get live pattern updates from the API.
 
 ---
 
@@ -205,7 +205,7 @@ $ ./mandate-ledger.sh audit
 
 ## Modes
 
-1. **Local** (default) — Fully offline, mandates in `~/.openclaw/agent-passport/`
+1. **Local** (default) — Mandates stored locally in `~/.openclaw/agent-passport/`. Free tier: fully offline. Pro tier: periodic API calls for license validation and threat definition updates.
 2. **Preview** — Validation only, no storage
 3. **Live (roadmap)** — Future connection to Agent Bridge for multi-agent sync (not yet implemented)
 
