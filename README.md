@@ -1,16 +1,47 @@
 # Agent Passport
 
-Consent-gating for ALL sensitive agent actions. Includes a pre-install skill scanner and runtime injection detection.
+Consent-gating for ALL sensitive agent actions. 75+ data-driven threat definitions with auto-updates. Like antivirus signature updates for your AI agent stack.
 
-## What's new in v2.3.0: ToxicSkills Defense
+## What's new in v2.4.0: Real-Time Threat Definitions
 
-Snyk scanned 3,984 ClawHub skills in February 2026. 36% had security flaws, 13.4% had critical issues (credential theft, backdoor installation, remote code execution), and 76 confirmed malicious payloads were found. Eight were still live at time of publication.
+All security patterns are now **data-driven** instead of hardcoded. Definitions load from a versioned JSON file at runtime, and Pro users get automatic updates every 6 hours from our threat intelligence API.
 
-v2.3.0 adds two commands to address this directly.
+```bash
+# Check your current definitions
+mandate-ledger.sh definitions-status
+# Version: 2026.02.26.1
+# Scan patterns: 28
+# Injection patterns: 20
+# SSRF blocked hosts: 6
+# Path traversal sequences: 7
+
+# Update manually (or let auto-update handle it)
+mandate-ledger.sh update-definitions
+
+# Initialize definitions on first use
+mandate-ledger.sh init-definitions
+```
+
+**Free tier:** Definitions update with each skill release. **Pro tier ($19/mo):** Definitions auto-update every 6 hours silently in the background. New patterns are available within hours of discovery. [Get Pro](https://agentpassportai.com/pro/)
+
+### What's covered
+
+| Shield | Patterns | What it catches |
+|--------|----------|----------------|
+| **Skill Scanner** | 28 scan patterns | Remote exec, base64 payloads, hardcoded secrets, cron persistence, SSH tampering |
+| **Injection Shield** | 20 injection patterns | Instruction override, persona hijack, exfiltration, token manipulation |
+| **SSRF Shield** | 6 blocked hosts + 6 schemes | Cloud metadata endpoints, private networks, dangerous protocols |
+| **Path Traversal Guard** | 7 sequences | Directory traversal, URL-encoded variants |
+
+Every scan and check stamps its output with `definitions_version` for full traceability.
+
+## v2.3.0: ToxicSkills Defense
+
+Snyk scanned 3,984 ClawHub skills in February 2026. 36% had security flaws, 13.4% had critical issues, and 76 confirmed malicious payloads were found.
 
 ### scan-skill
 
-Run before installing anything from ClawHub. Scans every file for dangerous patterns and flags by severity.
+Run before installing anything from ClawHub:
 
 ```bash
 mandate-ledger.sh scan-skill ./some-skill/
@@ -23,11 +54,9 @@ mandate-ledger.sh scan-skill ./some-skill/
 # RESULT: UNSAFE - do NOT install this skill.
 ```
 
-Detects: curl-pipe-bash, base64 eval chains, hardcoded API keys, global npm installs, SSH config writes, crontab modification, and prompt injection attempts embedded in skill instructions. Supports `--json` and `--strict` (CI-friendly exit codes).
-
 ### check-injection
 
-Scans inbound content before the agent processes it. Catches instruction overrides, exfiltration attempts, secrecy instructions, and role injection hidden in web results, emails, or files.
+Scans inbound content before the agent processes it:
 
 ```bash
 mandate-ledger.sh check-injection "$(cat email_body.txt)" --source email
@@ -35,7 +64,7 @@ mandate-ledger.sh check-injection "$(cat email_body.txt)" --source email
 # VERDICT: BLOCKED - content contains injection attempt(s)
 ```
 
-Both commands are fully offline. No API calls, no new dependencies.
+Both commands work fully offline. Pro users get live pattern updates automatically.
 
 ---
 

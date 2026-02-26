@@ -1,7 +1,7 @@
 ---
 name: agent-passport
-version: 2.3.2
-description: "OAuth for the agentic era — consent-gating for ALL sensitive agent actions including purchases, emails, file operations, system commands, and API calls. Provides spending caps, rate limits, allowlists, TTL expiry, audit trails, KYA (Know Your Agent) metadata, SSRF Shield, Path Traversal Guard, Webhook Origin Verification, Skill Scanner, and Injection Shield."
+version: 2.4.0
+description: "OAuth for the agentic era. Consent-gating for ALL sensitive agent actions. 75+ data-driven threat definitions with auto-updates (like antivirus signatures). Includes Skill Scanner, Injection Shield, SSRF Shield, Path Traversal Guard, spending caps, rate limits, allowlists, TTL expiry, audit trails, and KYA metadata. Pro tier adds real-time threat definition updates every 6 hours."
 metadata: {"openclaw":{"requires":{"bins":["jq","bc","xxd","head","date","mkdir"],"env":["AGENT_PASSPORT_LEDGER_DIR"]}}}
 user-invocable: true
 ---
